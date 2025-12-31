@@ -9,15 +9,6 @@ from typing import List, Dict, Tuple, Optional
 
 import streamlit as st
 
-# =========================
-# Optional PDF support
-# =========================
-PYPDF_OK = True
-try:
-    from pypdf import PdfReader
-except Exception:
-    PYPDF_OK = False
-
 
 # =========================
 # Basic Spanish stopwords (compact)
@@ -542,3 +533,4 @@ if go:
                 file_name="mindmap.md",
                 mime="text/markdown",
             )
+

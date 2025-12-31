@@ -7,6 +7,7 @@ from collections import Counter, defaultdict
 from datetime import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components
 
 # -----------------------------
 # Optional deps (safe flags)
@@ -26,9 +27,9 @@ except Exception:
     PPTX_OK = False
 
 
-# -----------------------------
-# Compact Spanish stopwords
-# -----------------------------
+# =========================
+# Stopwords ES (compact)
+# =========================
 STOPWORDS_ES = {
     "a","acá","ahí","al","algo","algunos","ante","antes","apenas","aquí","así","aun","aunque",
     "bajo","bien","cada","casi","como","con","contra","cual","cuales","cuando","cuanto","de",
@@ -41,36 +42,31 @@ STOPWORDS_ES = {
     "todo","todos","tu","tus","un","una","uno","unos","y","ya","yo"
 }
 
-
-# -----------------------------
+# =========================
 # Text utilities
-# -----------------------------
-def clean_text(t):
+# =========================
+def clean_text(t: str) -> str:
     t = (t or "").replace("\x00", " ")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
-def normalize_token(w):
+def normalize_token(w: str) -> str:
     w = (w or "").lower()
     w = re.sub(r"^[^\wáéíóúüñ]+|[^\wáéíóúüñ]+$", "", w, flags=re.UNICODE)
     return w
 
-def tokenize_words(text):
+def tokenize_words(text: str):
     words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", text or "", flags=re.UNICODE)
     out = []
     for w in words:
         w = normalize_token(w)
-        if not w:
-            continue
-        if w in STOPWORDS_ES:
-            continue
-        if len(w) <= 2:
+        if not w or w in STOPWORDS_ES or len(w) <= 2:
             continue
         out.append(w)
     return out
 
-def split_sentences(text):
+def split_sentences(text: str):
     text = re.sub(r"\s+", " ", (text or "")).strip()
     if not text:
         return []
@@ -79,7 +75,7 @@ def split_sentences(text):
         parts = re.split(r"\s{2,}|;\s+", text)
     return [p.strip() for p in parts if p and p.strip()]
 
-def pdf_to_text(file_bytes):
+def pdf_to_text(file_bytes: bytes) -> str:
     if not PYPDF_OK:
         raise RuntimeError("Falta pypdf. Añádelo a requirements.txt.")
     bio = io.BytesIO(file_bytes)
@@ -92,10 +88,9 @@ def pdf_to_text(file_bytes):
             pages.append("")
     return clean_text("\n\n".join(pages))
 
-
-# -----------------------------
-# Classic NLP scoring (TF-IDF)
-# -----------------------------
+# =========================
+# TF-IDF summary helpers
+# =========================
 def tfidf_sentence_scores(sentences):
     if not sentences:
         return [], {}
@@ -107,9 +102,7 @@ def tfidf_sentence_scores(sentences):
             df[t] += 1
 
     N = max(1, len(sentences))
-    idf = {}
-    for t, c in df.items():
-        idf[t] = math.log((N + 1) / (c + 1)) + 1.0  # smoothed
+    idf = {t: (math.log((N + 1) / (c + 1)) + 1.0) for t, c in df.items()}
 
     scores = []
     for toks in sent_tokens:
@@ -133,7 +126,7 @@ def pick_top_sentences(sentences, n):
     chosen = sorted(idx[:n])
     return [sentences[i] for i in chosen]
 
-def top_keywords(text, k=14):
+def top_keywords(text, k=16):
     toks = tokenize_words(text)
     if not toks:
         return []
@@ -156,85 +149,150 @@ def find_def_sentence(term, sentences):
     def_like = [s for s in candidates if any(c in (" " + s.lower() + " ") for c in cues)]
     return (def_like[0] if def_like else candidates[0]).strip()
 
-def chunk_list(lst, size):
-    return [lst[i:i + size] for i in range(0, len(lst), size)]
+# =========================
+# Bullet cleanup (KEY FIX)
+# =========================
+def normalize_bullet_text(s: str) -> str:
+    s = clean_text(s)
+    # sustituye bullets incrustados por separadores claros
+    s = s.replace("•", " | ")
+    s = re.sub(r"\s*\|\s*", " | ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
+def split_into_small_bullets(text: str, max_len=110):
+    """
+    Convierte frases largas (y las que llevan ' | ') en bullets cortos y legibles.
+    """
+    text = normalize_bullet_text(text)
+    if not text:
+        return []
 
-# -----------------------------
-# Notes generator (Markdown structured)
-# -----------------------------
-def generate_notes_md(text, detail):
+    # 1) si hay separador interno, lo dividimos
+    parts = [p.strip() for p in text.split("|") if p.strip()]
+
+    # 2) también corta por puntuación para mejorar legibilidad
+    refined = []
+    for p in parts:
+        if len(p) <= max_len:
+            refined.append(p)
+        else:
+            # cortar por ". " o "; "
+            chunks = re.split(r"(?<=\.)\s+|;\s+", p)
+            for c in chunks:
+                c = c.strip()
+                if not c:
+                    continue
+                # si aún es larguísimo, cortar en trozos
+                while len(c) > max_len:
+                    cut = c.rfind(" ", 0, max_len)
+                    if cut <= 40:
+                        cut = max_len
+                    refined.append(c[:cut].strip())
+                    c = c[cut:].strip()
+                if c:
+                    refined.append(c)
+
+    # limpiar duplicados cercanos
+    out = []
+    seen = set()
+    for r in refined:
+        key = r.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
+
+# =========================
+# Notes generator (clean Markdown)
+# =========================
+def generate_notes_sections(text, detail):
+    """
+    Devuelve (title, sections) para usar en PPTX y en la UI.
+    sections: list[ {title: str, bullets: list[str]} ]
+    """
     text = clean_text(text)
     if not text:
-        return "# Apuntes\n\n(No hay contenido)"
+        return "Apuntes", [{"title":"Contenido", "bullets":["(Sin contenido)"]}]
 
     sents = split_sentences(text)
-    kws = top_keywords(text, k=14)
+    kws = top_keywords(text, k=16)
 
     if detail == "breve":
-        n = 7
+        n = 8
     elif detail == "exhaustivo":
         n = 18
     else:
         n = 12
 
     key_sents = pick_top_sentences(sents, n)
-    sum10 = pick_top_sentences(sents, 10)
+    glos = []
+    for term in kws[:10]:
+        ds = find_def_sentence(term, sents)
+        if ds:
+            glos.append(f"{term}: {ds}")
 
     title = " ".join([k.capitalize() for k in kws[:3]]) if kws else "Apuntes"
 
-    md = []
-    md.append(f"# {title}")
-    md.append("")
-    md.append("## Ideas clave")
+    sections = []
+
+    # Ideas clave (bullets cortos)
+    bullets = []
     for s in key_sents:
-        md.append(f"- {s}")
+        bullets += split_into_small_bullets(s, max_len=110)
+    sections.append({"title": "Ideas clave", "bullets": bullets[:24] if bullets else ["(Sin ideas detectadas)"]})
 
-    md.append("")
-    md.append("## Glosario")
-    for term in (kws[:10] if kws else []):
-        ds = find_def_sentence(term, sents)
-        if ds:
-            md.append(f"- **{term}**: {ds}")
-        else:
-            md.append(f"- **{term}**: (no consta una definición explícita)")
+    if glos:
+        gbul = []
+        for g in glos:
+            gbul += split_into_small_bullets(g, max_len=120)
+        sections.append({"title": "Glosario", "bullets": gbul[:22]})
 
-    md.append("")
-    md.append("## Resumen en 10 líneas")
-    for s in sum10[:10]:
-        md.append(f"- {s}")
+    # Resumen corto
+    sum_sents = pick_top_sentences(sents, 10)
+    sbul = []
+    for s in sum_sents[:10]:
+        sbul += split_into_small_bullets(s, max_len=110)
+    sections.append({"title": "Resumen", "bullets": sbul[:18]})
 
-    md.append("")
-    md.append("## Preguntas de repaso")
-    md += [f"- ¿Cómo explicarías **{k}** con tus palabras?" for k in (kws[:5] if kws else ["el tema"])]
+    # Preguntas de repaso
+    q = [f"¿Cómo explicarías {k} con tus palabras?" for k in (kws[:6] if kws else ["el tema"])]
+    sections.append({"title": "Preguntas de repaso", "bullets": q})
 
+    return title, sections
+
+def sections_to_markdown(title, sections):
+    md = [f"# {title}", ""]
+    for sec in sections:
+        md.append(f"## {sec['title']}")
+        for b in sec.get("bullets", []):
+            md.append(f"- {b}")
+        md.append("")
     return "\n".join(md).strip()
 
-
-# -----------------------------
-# Flashcards generator (JSON + Anki TSV)
-# -----------------------------
+# =========================
+# Flashcards (better quality + UI)
+# =========================
 def generate_flashcards(text, n_cards):
     text = clean_text(text)
     sents = split_sentences(text)
-    kws = top_keywords(text, k=max(20, n_cards))
+    kws = top_keywords(text, k=max(22, n_cards))
+
     cards = []
 
-    # 1) definitional cards
+    # definiciones
     for term in kws:
         if len(cards) >= n_cards:
             break
         ds = find_def_sentence(term, sents)
         if ds:
-            cards.append({
-                "front": f"¿Qué es {term}?",
-                "back": ds,
-                "tags": [term]
-            })
+            back = " ".join(split_into_small_bullets(ds, max_len=120)[:2])
+            cards.append({"front": f"¿Qué es {term}?", "back": back, "tag": term})
 
-    # 2) cloze cards
+    # cloze con frases cortas
     if len(cards) < n_cards:
-        pool = [s for s in sents if len(tokenize_words(s)) >= 7]
+        pool = [s for s in sents if 8 <= len(tokenize_words(s)) <= 26]
         random.shuffle(pool)
         for s in pool:
             if len(cards) >= n_cards:
@@ -247,36 +305,24 @@ def generate_flashcards(text, n_cards):
             cloze = re.sub(rf"\b{re.escape(target)}\b", "_____", s, flags=re.IGNORECASE)
             cards.append({
                 "front": f"Completa: {cloze}",
-                "back": f"Palabra: **{target}**\n\nFrase original: {s}",
-                "tags": [target]
+                "back": f"La palabra era: {target}",
+                "tag": target
             })
 
-    return {"flashcards": cards[:n_cards]}
+    return cards[:n_cards]
 
-def flashcards_to_anki_tsv(fc_json):
-    lines = []
-    for c in fc_json.get("flashcards", []):
-        front = (c.get("front", "") or "").replace("\t", " ").strip()
-        back = (c.get("back", "") or "").replace("\t", " ").strip()
-        tags = " ".join(c.get("tags", []) or [])
-        # Anki: Front<TAB>Back<TAB>Tags (optional)
-        lines.append(f"{front}\t{back}\t{tags}")
-    return "\n".join(lines)
-
-
-# -----------------------------
-# Mindmap generator (Mermaid)
-# -----------------------------
+# =========================
+# Mindmap (real render via Mermaid.js CDN)
+# =========================
 def generate_mindmap_mermaid(text, max_nodes=60):
     text = clean_text(text)
     if not text:
-        return "```mermaid\nmindmap\n  root((Sin contenido))\n```"
+        return "mindmap\n  root((Sin contenido))"
 
     sents = split_sentences(text)
     kws = top_keywords(text, k=18)
     root = kws[0].capitalize() if kws else "Tema"
 
-    # co-occurrence graph (keyword-keyword)
     co = defaultdict(Counter)
     for s in sents:
         toks = set(tokenize_words(s))
@@ -286,224 +332,419 @@ def generate_mindmap_mermaid(text, max_nodes=60):
                 if a != b:
                     co[a][b] += 1
 
-    # build mindmap
-    lines = ["```mermaid", "mindmap", f"  root(({root}))"]
-    node_count = 1
-
-    top_branches = kws[1:7] if len(kws) > 1 else []
-    for k in top_branches:
-        if node_count >= max_nodes:
+    lines = ["mindmap", f"  root(({root}))"]
+    count = 1
+    branches = kws[1:7] if len(kws) > 1 else []
+    for k in branches:
+        if count >= max_nodes:
             break
         lines.append(f"    {k}")
-        node_count += 1
+        count += 1
         for sub, _ in co[k].most_common(3):
-            if node_count >= max_nodes:
+            if count >= max_nodes:
                 break
             lines.append(f"      {sub}")
-            node_count += 1
-
-    lines.append("```")
+            count += 1
     return "\n".join(lines)
 
+def render_mermaid(mermaid_code: str, height: int = 620):
+    """
+    Render real Mermaid diagrams in Streamlit without installing anything.
+    Uses Mermaid.js via CDN.
+    """
+    mermaid_code = (mermaid_code or "").strip()
+    if not mermaid_code:
+        st.info("No hay mindmap para renderizar.")
+        return
 
-# -----------------------------
-# PPTX "pro" generator
-# -----------------------------
+    html = f"""
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+  <style>
+    body {{ margin: 0; padding: 0; background: transparent; }}
+    .wrap {{
+      padding: 10px 8px 0 8px;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+    }}
+    .card {{
+      background: #ffffff;
+      border: 1px solid rgba(0,0,0,0.06);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 8px 28px rgba(0,0,0,0.06);
+    }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <div class="mermaid">
+{mermaid_code}
+      </div>
+    </div>
+  </div>
+  <script>
+    mermaid.initialize({{
+      startOnLoad: true,
+      securityLevel: "loose",
+      theme: "base",
+      themeVariables: {{
+        fontFamily: "Inter, Segoe UI, Arial",
+        primaryColor: "#ff4b4b",
+        primaryTextColor: "#111111",
+        lineColor: "#c9c9c9",
+        tertiaryColor: "#f7f7f7"
+      }}
+    }});
+  </script>
+</body>
+</html>
+"""
+    components.html(html, height=height, scrolling=True)
+
+# =========================
+# PPTX PRO (real improvement)
+# =========================
 def _rgb(hexstr):
     hexstr = hexstr.lstrip("#")
     return RGBColor(int(hexstr[0:2], 16), int(hexstr[2:4], 16), int(hexstr[4:6], 16))
 
-def _add_top_bar(slide, color="#ff4b4b"):
-    # bar across top
-    left = Inches(0)
-    top = Inches(0)
-    width = Inches(13.333)  # widescreen default
-    height = Inches(0.28)
-    shape = slide.shapes.add_shape(1, left, top, width, height)  # 1 = MSO_SHAPE.RECTANGLE
-    fill = shape.fill
-    fill.solid()
-    fill.fore_color.rgb = _rgb(color)
-    shape.line.fill.background()
+def _set_bg(slide, color="#ffffff"):
+    # Add a full-slide rectangle background
+    shp = slide.shapes.add_shape(
+        1, Inches(0), Inches(0), Inches(13.333), Inches(7.5)
+    )
+    shp.fill.solid()
+    shp.fill.fore_color.rgb = _rgb(color)
+    shp.line.fill.background()
+    # send to back
+    slide.shapes._spTree.remove(shp._element)
+    slide.shapes._spTree.insert(2, shp._element)
 
-def _set_title(slide, title, color="#111111"):
-    title_shape = slide.shapes.title
-    title_shape.text = title
-    for p in title_shape.text_frame.paragraphs:
-        for r in p.runs:
-            r.font.size = Pt(38)
-            r.font.bold = True
-            r.font.color.rgb = _rgb(color)
+def _top_bar(slide, accent="#ff4b4b"):
+    bar = slide.shapes.add_shape(1, Inches(0), Inches(0), Inches(13.333), Inches(0.3))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = _rgb(accent)
+    bar.line.fill.background()
 
-def _add_footer(slide, text_left="", text_right="", color="#666666"):
-    # small footer text
-    left = Inches(0.6)
-    top = Inches(7.05)
-    width = Inches(12.2)
-    height = Inches(0.3)
-    tx = slide.shapes.add_textbox(left, top, width, height)
+def _left_accent(slide, accent="#ff4b4b"):
+    bar = slide.shapes.add_shape(1, Inches(0), Inches(0), Inches(0.22), Inches(7.5))
+    bar.fill.solid()
+    bar.fill.fore_color.rgb = _rgb(accent)
+    bar.line.fill.background()
+
+def _title_textbox(slide, text, y=0.65, size=34, bold=True):
+    tx = slide.shapes.add_textbox(Inches(0.9), Inches(y), Inches(12.2), Inches(0.9))
     tf = tx.text_frame
     tf.clear()
     p = tf.paragraphs[0]
-    p.text = text_left
+    r = p.add_run()
+    r.text = text
+    r.font.size = Pt(size)
+    r.font.bold = bold
+    r.font.color.rgb = _rgb("#111111")
+    r.font.name = "Calibri"
+    return tx
+
+def _subtitle(slide, text, y=1.55, size=16):
+    tx = slide.shapes.add_textbox(Inches(0.92), Inches(y), Inches(12.0), Inches(0.6))
+    tf = tx.text_frame
+    tf.clear()
+    p = tf.paragraphs[0]
+    r = p.add_run()
+    r.text = text
+    r.font.size = Pt(size)
+    r.font.color.rgb = _rgb("#555555")
+    r.font.name = "Calibri"
+    return tx
+
+def _footer(slide, left_text, right_text, slide_no=None):
+    y = Inches(7.08)
+    txl = slide.shapes.add_textbox(Inches(0.9), y, Inches(8), Inches(0.35))
+    tfl = txl.text_frame
+    tfl.clear()
+    p = tfl.paragraphs[0]
+    p.text = left_text
     p.font.size = Pt(10)
-    p.font.color.rgb = _rgb(color)
+    p.font.color.rgb = _rgb("#777777")
+    p.font.name = "Calibri"
 
-    # right aligned
-    tx2 = slide.shapes.add_textbox(Inches(10.6), top, Inches(2.6), height)
-    tf2 = tx2.text_frame
-    tf2.clear()
-    p2 = tf2.paragraphs[0]
-    p2.text = text_right
+    txr = slide.shapes.add_textbox(Inches(9.5), y, Inches(3.8), Inches(0.35))
+    tfr = txr.text_frame
+    tfr.clear()
+    p2 = tfr.paragraphs[0]
+    p2.text = right_text if slide_no is None else f"{right_text} • {slide_no}"
     p2.font.size = Pt(10)
-    p2.font.color.rgb = _rgb(color)
-    p2.alignment = 2  # right
+    p2.font.color.rgb = _rgb("#777777")
+    p2.font.name = "Calibri"
+    p2.alignment = 2
 
-def _add_bullets(slide, bullets, font_size=22):
-    # layout 1: Title and Content
-    body = slide.shapes.placeholders[1].text_frame
-    body.clear()
+def _card_box(slide, x, y, w, h, fill="#ffffff"):
+    box = slide.shapes.add_shape(1, Inches(x), Inches(y), Inches(w), Inches(h))
+    box.fill.solid()
+    box.fill.fore_color.rgb = _rgb(fill)
+    box.line.color.rgb = _rgb("#e6e6e6")
+    return box
+
+def _bullets_textbox(slide, bullets, x, y, w, h, font_size=20):
+    tx = slide.shapes.add_textbox(Inches(x), Inches(y), Inches(w), Inches(h))
+    tf = tx.text_frame
+    tf.word_wrap = True
+    tf.clear()
+
     for i, b in enumerate(bullets):
-        p = body.paragraphs[0] if i == 0 else body.add_paragraph()
+        p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         p.text = b
         p.level = 0
         p.font.size = Pt(font_size)
+        p.font.color.rgb = _rgb("#222222")
+        p.font.name = "Calibri"
+    return tx
 
-def _parse_notes_to_sections(notes_md):
-    notes_md = (notes_md or "").replace("\r\n", "\n").strip()
-    title = "Presentación"
-    sections = []
-    current = None
-
-    for line in notes_md.split("\n"):
-        line = line.rstrip()
-        if line.startswith("# "):
-            title = line[2:].strip() or title
-        elif line.startswith("## "):
-            if current:
-                sections.append(current)
-            current = {"title": line[3:].strip() or "Sección", "bullets": []}
-        elif line.startswith("- "):
-            if not current:
-                current = {"title": "Contenido", "bullets": []}
-            b = line[2:].strip().replace("**", "")
-            if b:
-                current["bullets"].append(b)
-
-    if current:
-        sections.append(current)
-
-    if not sections:
-        sections = [{"title": "Contenido", "bullets": [clean_text(notes_md)[:500]]}]
-
-    return title, sections
-
-def notes_to_pptx_bytes(notes_md, deck_title, max_bullets_per_slide=6, accent="#ff4b4b"):
+def build_pptx_pro(title, sections, accent="#ff4b4b", max_bullets=8):
     if not PPTX_OK:
         raise RuntimeError("Falta python-pptx. Añádelo a requirements.txt.")
 
-    title, sections = _parse_notes_to_sections(notes_md)
-    if deck_title:
-        title = deck_title
-
     prs = Presentation()
-    # Force widescreen 13.333 x 7.5 (default in many installs already)
     prs.slide_width = Inches(13.333)
     prs.slide_height = Inches(7.5)
 
     date_str = datetime.now().strftime("%Y-%m-%d")
 
-    # 1) Cover
-    slide = prs.slides.add_slide(prs.slide_layouts[0])  # title slide
-    _add_top_bar(slide, accent)
-    _set_title(slide, title)
-    if len(slide.placeholders) > 1:
-        slide.placeholders[1].text = "Resumen automático • Flashcards • Mindmap"
-    _add_footer(slide, text_left="StudyWave (sin API)", text_right=date_str)
+    # Cover (blank layout 6 usually, but safe to use layout 0 then overwrite)
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _set_bg(slide, "#fbfbfd")
+    _top_bar(slide, accent)
+    _left_accent(slide, accent)
+    _title_textbox(slide, title, y=1.55, size=42, bold=True)
+    _subtitle(slide, "Presentación automática (sin API) • Flashcards • Mindmap", y=2.45, size=16)
+    _footer(slide, "StudyWave PRO", date_str)
 
-    # 2) Agenda
-    slide = prs.slides.add_slide(prs.slide_layouts[1])
-    _add_top_bar(slide, accent)
-    slide.shapes.title.text = "Agenda"
-    agenda_items = [s["title"] for s in sections][:12]
-    _add_bullets(slide, agenda_items, font_size=24)
-    _add_footer(slide, text_left="Agenda", text_right="2", color="#777777")
+    # Agenda
+    slide_no = 2
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _set_bg(slide, "#ffffff")
+    _top_bar(slide, accent)
+    _title_textbox(slide, "Agenda", y=0.85, size=34)
+    agenda = [s["title"] for s in sections][:12]
+    _card_box(slide, 0.9, 1.7, 12.0, 4.9, fill="#ffffff")
+    numbered = [f"{i+1}. {t}" for i, t in enumerate(agenda)]
+    _bullets_textbox(slide, numbered, 1.15, 1.95, 11.5, 4.4, font_size=22)
+    _footer(slide, "Agenda", date_str, slide_no)
+    slide_no += 1
 
-    # 3+) Sections
-    slide_no = 3
+    # Content
     for sec in sections:
-        bullets = sec.get("bullets", []) or ["(Sin puntos detectados en esta sección)"]
-        bullet_chunks = chunk_list(bullets, max_bullets_per_slide)
+        bullets_raw = sec.get("bullets", []) or ["(Sin puntos)"]
 
-        for j, chunk in enumerate(bullet_chunks):
-            slide = prs.slides.add_slide(prs.slide_layouts[1])
-            _add_top_bar(slide, accent)
-            slide.shapes.title.text = sec["title"] if j == 0 else f"{sec['title']} (cont.)"
-            _add_bullets(slide, chunk, font_size=22)
-            _add_footer(slide, text_left=sec["title"], text_right=str(slide_no), color="#777777")
+        # recortar y limpiar
+        bullets = []
+        for b in bullets_raw:
+            bullets += split_into_small_bullets(b, max_len=110)
+        bullets = bullets[:60] if bullets else ["(Sin puntos)"]
+
+        # Section divider
+        div = prs.slides.add_slide(prs.slide_layouts[6])
+        _set_bg(div, "#fbfbfd")
+        _top_bar(div, accent)
+        _left_accent(div, accent)
+        _title_textbox(div, sec["title"], y=2.3, size=46, bold=True)
+        _subtitle(div, "Bloque de contenidos", y=3.25, size=16)
+        _footer(div, sec["title"], date_str, slide_no)
+        slide_no += 1
+
+        # Slides for bullets
+        chunks = [bullets[i:i+max_bullets*2] for i in range(0, len(bullets), max_bullets*2)]
+        for chunk in chunks:
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+            _set_bg(slide, "#ffffff")
+            _top_bar(slide, accent)
+            _title_textbox(slide, sec["title"], y=0.7, size=32)
+
+            # Two columns if many bullets
+            if len(chunk) > max_bullets:
+                left = chunk[:max_bullets]
+                right = chunk[max_bullets:max_bullets*2]
+
+                _card_box(slide, 0.9, 1.55, 5.95, 5.25, fill="#ffffff")
+                _card_box(slide, 6.95, 1.55, 5.95, 5.25, fill="#ffffff")
+                _bullets_textbox(slide, left, 1.15, 1.8, 5.45, 4.8, font_size=20)
+                _bullets_textbox(slide, right, 7.2, 1.8, 5.45, 4.8, font_size=20)
+            else:
+                _card_box(slide, 0.9, 1.55, 12.0, 5.25, fill="#ffffff")
+                _bullets_textbox(slide, chunk, 1.15, 1.8, 11.5, 4.8, font_size=22)
+
+            _footer(slide, sec["title"], date_str, slide_no)
             slide_no += 1
+
+    # Final takeaways
+    all_bul = []
+    for s in sections:
+        for b in s.get("bullets", []):
+            all_bul += split_into_small_bullets(b, max_len=110)
+    take = all_bul[:10] if all_bul else ["(Sin conclusiones)"]
+
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _set_bg(slide, "#ffffff")
+    _top_bar(slide, accent)
+    _title_textbox(slide, "Takeaways", y=0.8, size=34)
+    _card_box(slide, 0.9, 1.55, 12.0, 5.25, fill="#ffffff")
+    _bullets_textbox(slide, take, 1.15, 1.8, 11.5, 4.8, font_size=22)
+    _footer(slide, "Cierre", date_str, slide_no)
 
     bio = io.BytesIO()
     prs.save(bio)
     bio.seek(0)
     return bio.getvalue()
 
+# =========================
+# Flashcards UI (real cards)
+# =========================
+def inject_card_css():
+    st.markdown(
+        """
+<style>
+.sw-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+@media (min-width: 900px) { .sw-grid { grid-template-columns: 1fr 1fr; } }
+.sw-card {
+  background: #ffffff;
+  border: 1px solid rgba(0,0,0,0.06);
+  border-radius: 18px;
+  padding: 16px 16px;
+  box-shadow: 0 10px 28px rgba(0,0,0,0.06);
+}
+.sw-pill {
+  display: inline-block;
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: rgba(255,75,75,0.12);
+  color: #b61f1f;
+  border: 1px solid rgba(255,75,75,0.25);
+  margin-bottom: 10px;
+}
+.sw-front { font-size: 18px; font-weight: 700; color: #111; margin-bottom: 10px; }
+.sw-back  { font-size: 16px; color: #222; line-height: 1.35; }
+.sw-muted { color: #666; font-size: 12px; }
+</style>
+""",
+        unsafe_allow_html=True
+    )
 
-# -----------------------------
-# UI
-# -----------------------------
+def flashcard_view(cards):
+    if not cards:
+        st.info("No hay flashcards generadas.")
+        return
+
+    if "fc_idx" not in st.session_state:
+        st.session_state.fc_idx = 0
+    if "fc_show_back" not in st.session_state:
+        st.session_state.fc_show_back = False
+
+    idx = st.session_state.fc_idx % len(cards)
+    card = cards[idx]
+
+    inject_card_css()
+
+    st.markdown('<div class="sw-card">', unsafe_allow_html=True)
+    st.markdown(f'<div class="sw-pill">#{card.get("tag","")}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="sw-front">{card.get("front","")}</div>', unsafe_allow_html=True)
+
+    if st.session_state.fc_show_back:
+        st.markdown(f'<div class="sw-back">{card.get("back","")}</div>', unsafe_allow_html=True)
+    else:
+        st.markdown('<div class="sw-muted">Pulsa “Mostrar respuesta” para ver el reverso.</div>', unsafe_allow_html=True)
+
+    st.markdown(f'<div class="sw-muted">Tarjeta {idx+1} / {len(cards)}</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    c1, c2, c3, c4 = st.columns([1,1,1,1])
+    with c1:
+        if st.button("⬅️ Anterior", use_container_width=True):
+            st.session_state.fc_idx = (idx - 1) % len(cards)
+            st.session_state.fc_show_back = False
+            st.rerun()
+    with c2:
+        if st.button("🔁 Barajar", use_container_width=True):
+            random.shuffle(cards)
+            st.session_state.fc_idx = 0
+            st.session_state.fc_show_back = False
+            st.rerun()
+    with c3:
+        if st.button("👁️ Mostrar respuesta" if not st.session_state.fc_show_back else "🙈 Ocultar respuesta", use_container_width=True):
+            st.session_state.fc_show_back = not st.session_state.fc_show_back
+            st.rerun()
+    with c4:
+        if st.button("Siguiente ➡️", use_container_width=True):
+            st.session_state.fc_idx = (idx + 1) % len(cards)
+            st.session_state.fc_show_back = False
+            st.rerun()
+
+    st.progress((idx + 1) / len(cards))
+
+def flashcards_export_json(cards):
+    return {"flashcards": [{"front": c["front"], "back": c["back"], "tags":[c.get("tag","")]} for c in cards]}
+
+def flashcards_to_anki_tsv(cards):
+    lines = []
+    for c in cards:
+        front = (c.get("front","") or "").replace("\t"," ").strip()
+        back = (c.get("back","") or "").replace("\t"," ").strip()
+        tag = c.get("tag","") or ""
+        lines.append(f"{front}\t{back}\t{tag}")
+    return "\n".join(lines)
+
+# =========================
+# Streamlit UI
+# =========================
 st.set_page_config(page_title="StudyWave PRO (sin API)", page_icon="🧠", layout="wide")
-st.title("🧠 StudyWave PRO — Apuntes + PPTX + Flashcards + Mindmap (SIN API)")
+st.title("🧠 StudyWave PRO — PPTX + Flashcards + Mindmap (SIN API, sin modelos)")
 
 with st.sidebar:
-    st.subheader("Estado")
+    st.subheader("Estado librerías")
     st.write(f"pypdf (PDF): {'✅' if PYPDF_OK else '❌'}")
     st.write(f"python-pptx (PPTX): {'✅' if PPTX_OK else '❌'}")
-    if not PYPDF_OK:
-        st.caption("Para PDF: añade pypdf a requirements.txt")
-    if not PPTX_OK:
-        st.caption("Para PPTX: añade python-pptx a requirements.txt")
 
     st.divider()
     source = st.radio("Fuente", ["PDF", "Texto"], index=0)
     detail = st.selectbox("Nivel de apuntes", ["breve", "medio", "exhaustivo"], index=1)
 
     st.divider()
-    st.subheader("Salidas")
-    want_notes = st.checkbox("Apuntes", True)
-    want_pptx = st.checkbox("PowerPoint PRO (.pptx)", True)
-    want_flash = st.checkbox("Flashcards / Fichas", True)
-    want_mindmap = st.checkbox("Mapa mental (Mermaid)", True)
+    accent = st.color_picker("Color acento", "#ff4b4b")
+    bullets_per_col = st.slider("Bullets por columna (PPT)", 5, 10, 8, 1)
+    n_flash = st.slider("Nº flashcards", 8, 60, 24, 1)
 
     st.divider()
-    accent = st.color_picker("Color acento PPT", "#ff4b4b")
-    max_bullets = st.slider("Bullets por diapositiva", 4, 10, 6, 1)
-    n_flash = st.slider("Nº flashcards", 5, 60, 20, 1)
+    st.caption("Sin API. No se instala IA. Todo se hace con reglas + NLP clásica.")
 
 content = ""
 doc_name = "apuntes"
 
 if source == "Texto":
-    content = st.text_area("Pega tus apuntes", height=260, placeholder="Pega aquí tus apuntes o texto...")
+    content = st.text_area("Pega tus apuntes", height=280, placeholder="Pega aquí tus apuntes o texto...")
 else:
     pdf = st.file_uploader("Sube un PDF", type=["pdf"])
     if pdf is not None:
         doc_name = re.sub(r"\.pdf$", "", pdf.name, flags=re.IGNORECASE) or "apuntes"
         try:
             if not PYPDF_OK:
-                st.error("No puedo leer PDF porque falta pypdf (requirements.txt).")
+                st.error("No puedo leer PDF porque falta pypdf en requirements.txt.")
                 content = ""
             else:
                 content = pdf_to_text(pdf.read())
                 st.success(f"Texto extraído: {len(content):,} caracteres")
                 if len(content.strip()) < 300:
-                    st.warning("He extraído muy poco texto. Si el PDF es escaneado (imagen), sin OCR no se puede leer.")
+                    st.warning("He extraído muy poco texto. Si tu PDF es escaneado (imagen), sin OCR no hay texto real.")
         except Exception as e:
             st.error("Error leyendo el PDF:")
             st.exception(e)
             content = ""
 
 st.divider()
-go = st.button("✨ Generar materiales", type="primary", use_container_width=True)
+go = st.button("✨ Generar materiales PRO", type="primary", use_container_width=True)
 
 if go:
     try:
@@ -511,85 +752,86 @@ if go:
             st.error("No hay texto para procesar.")
             st.stop()
 
-        # 1) Notes
-        notes_md = generate_notes_md(content, detail)
+        title, sections = generate_notes_sections(content, detail)
+        notes_md = sections_to_markdown(title, sections)
 
-        colA, colB = st.columns([1, 1], gap="large")
+        # Generate components
+        cards = generate_flashcards(content, n_flash)
+        mindmap = generate_mindmap_mermaid(content, max_nodes=70)
 
-        with colA:
-            if want_notes:
-                st.subheader("📚 Apuntes")
-                st.markdown(notes_md)
-                st.download_button(
-                    "⬇️ Descargar apuntes (.md)",
-                    data=notes_md.encode("utf-8"),
-                    file_name=f"{doc_name}_apuntes.md",
-                    mime="text/markdown",
-                    use_container_width=True,
-                )
+        # Layout tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["📚 Apuntes", "🃏 Flashcards (visual)", "🧩 Mindmap (real)", "📊 PowerPoint PRO"])
 
-        # 2) Flashcards
-        with colB:
-            if want_flash:
-                st.subheader("🃏 Flashcards / Fichas")
-                fc = generate_flashcards(content, n_flash)
-                st.caption("Formato JSON + export Anki (TSV).")
-                st.json(fc)
+        with tab1:
+            st.subheader("Apuntes (limpios y listos)")
+            st.markdown(notes_md)
+            st.download_button(
+                "⬇️ Descargar apuntes (.md)",
+                data=notes_md.encode("utf-8"),
+                file_name=f"{doc_name}_apuntes.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
 
+        with tab2:
+            st.subheader("Flashcards (tipo tarjetas)")
+            flashcard_view(cards)
+
+            st.divider()
+            c1, c2 = st.columns(2)
+            with c1:
+                fc_json = flashcards_export_json(cards)
                 st.download_button(
                     "⬇️ Descargar flashcards (.json)",
-                    data=json.dumps(fc, ensure_ascii=False, indent=2).encode("utf-8"),
+                    data=json.dumps(fc_json, ensure_ascii=False, indent=2).encode("utf-8"),
                     file_name=f"{doc_name}_flashcards.json",
                     mime="application/json",
                     use_container_width=True,
                 )
-                anki_tsv = flashcards_to_anki_tsv(fc)
+            with c2:
+                anki = flashcards_to_anki_tsv(cards)
                 st.download_button(
                     "⬇️ Descargar para Anki (.tsv)",
-                    data=anki_tsv.encode("utf-8"),
+                    data=anki.encode("utf-8"),
                     file_name=f"{doc_name}_anki.tsv",
                     mime="text/tab-separated-values",
                     use_container_width=True,
                 )
 
-        st.divider()
+        with tab3:
+            st.subheader("Mapa mental renderizado (no código)")
+            render_mermaid(mindmap, height=680)
 
-        # 3) Mindmap
-        if want_mindmap:
-            st.subheader("🧩 Mapa mental (Mermaid)")
-            mm = generate_mindmap_mermaid(content, max_nodes=60)
-            st.code(mm, language="markdown")
             st.download_button(
-                "⬇️ Descargar mindmap (.md)",
-                data=mm.encode("utf-8"),
-                file_name=f"{doc_name}_mindmap.md",
-                mime="text/markdown",
+                "⬇️ Descargar mindmap (Mermaid .mmd)",
+                data=mindmap.encode("utf-8"),
+                file_name=f"{doc_name}_mindmap.mmd",
+                mime="text/plain",
                 use_container_width=True,
             )
 
-        # 4) PPTX
-        if want_pptx:
-            st.subheader("📊 PowerPoint PRO")
+        with tab4:
+            st.subheader("PowerPoint PRO")
             if not PPTX_OK:
-                st.error("No puedo generar PPTX porque falta python-pptx (requirements.txt).")
+                st.error("No puedo generar PPTX porque falta python-pptx en requirements.txt.")
             else:
-                pptx_bytes = notes_to_pptx_bytes(
-                    notes_md=notes_md,
-                    deck_title=doc_name,
-                    max_bullets_per_slide=max_bullets,
-                    accent=accent
+                pptx_bytes = build_pptx_pro(
+                    title=doc_name,
+                    sections=sections,
+                    accent=accent,
+                    max_bullets=bullets_per_col
                 )
                 st.success(f"PPTX generado ✅ ({len(pptx_bytes)/1024:.1f} KB)")
                 st.download_button(
                     "⬇️ Descargar PowerPoint (.pptx)",
                     data=pptx_bytes,
-                    file_name=f"{doc_name}_presentacion_pro.pptx",
+                    file_name=f"{doc_name}_presentacion_PRO.pptx",
                     mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
                     use_container_width=True,
                 )
 
-        st.success("Todo listo ✅")
+        st.success("Listo ✅ (PPTX + Flashcards visuales + Mindmap real)")
 
     except Exception as e:
-        st.error("La app encontró un error, pero lo he capturado para que no se caiga. Detalle:")
+        st.error("Ocurrió un error (capturado para que la app no se caiga). Detalle:")
         st.exception(e)

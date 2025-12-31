@@ -1,12 +1,9 @@
-from __future__ import annotations
-
 import re
 import io
 import math
 import json
 import random
 from collections import Counter, defaultdict
-from typing import List, Dict, Tuple, Optional, Any
 
 import streamlit as st
 
@@ -39,20 +36,20 @@ STOPWORDS_ES = {
 # =========================
 # Text utilities
 # =========================
-def clean_text(t: str) -> str:
+def clean_text(t):
     t = (t or "").replace("\x00", " ")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
-def normalize_token(w: str) -> str:
+def normalize_token(w):
     w = w.lower()
     w = re.sub(r"^[^\wáéíóúüñ]+|[^\wáéíóúüñ]+$", "", w, flags=re.UNICODE)
     return w
 
-def tokenize_words(text: str) -> List[str]:
-    words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", text, flags=re.UNICODE)
-    tokens: List[str] = []
+def tokenize_words(text):
+    words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", text or "", flags=re.UNICODE)
+    tokens = []
     for w in words:
         nw = normalize_token(w)
         if not nw:
@@ -64,8 +61,7 @@ def tokenize_words(text: str) -> List[str]:
         tokens.append(nw)
     return tokens
 
-def split_sentences(text: str) -> List[str]:
-    # Simple sentence splitter robust to PDFs
+def split_sentences(text):
     text = re.sub(r"\s+", " ", (text or "")).strip()
     if not text:
         return []
@@ -74,12 +70,12 @@ def split_sentences(text: str) -> List[str]:
         parts = re.split(r"\s{2,}|;\s+", text)
     return [p.strip() for p in parts if p and p.strip()]
 
-def pdf_to_text(file_bytes: bytes) -> str:
+def pdf_to_text(file_bytes):
     if not PYPDF_OK:
         raise RuntimeError("PDF no disponible: instala pypdf (ver requirements.txt).")
     bio = io.BytesIO(file_bytes)
     reader = PdfReader(bio)
-    pages: List[str] = []
+    pages = []
     for p in reader.pages:
         try:
             pages.append(p.extract_text() or "")
@@ -91,7 +87,7 @@ def pdf_to_text(file_bytes: bytes) -> str:
 # =========================
 # Classic NLP scoring
 # =========================
-def tfidf_sentence_scores(sentences: List[str]) -> Tuple[List[float], Dict[str, float]]:
+def tfidf_sentence_scores(sentences):
     if not sentences:
         return [], {}
 
@@ -102,11 +98,11 @@ def tfidf_sentence_scores(sentences: List[str]) -> Tuple[List[float], Dict[str, 
             df[t] += 1
 
     N = max(1, len(sentences))
-    idf: Dict[str, float] = {}
+    idf = {}
     for t, c in df.items():
         idf[t] = math.log((N + 1) / (c + 1)) + 1.0  # smoothed
 
-    scores: List[float] = []
+    scores = []
     for toks in sent_tokens:
         if not toks:
             scores.append(0.0)
@@ -119,7 +115,7 @@ def tfidf_sentence_scores(sentences: List[str]) -> Tuple[List[float], Dict[str, 
 
     return scores, idf
 
-def pick_top_sentences(sentences: List[str], max_sentences: int) -> List[str]:
+def pick_top_sentences(sentences, max_sentences):
     if not sentences:
         return []
     scores, _ = tfidf_sentence_scores(sentences)
@@ -128,13 +124,13 @@ def pick_top_sentences(sentences: List[str], max_sentences: int) -> List[str]:
     chosen = sorted(idx[: max_sentences])
     return [sentences[i] for i in chosen]
 
-def top_keywords(text: str, k: int = 12) -> List[str]:
+def top_keywords(text, k=12):
     toks = tokenize_words(text)
     if not toks:
         return []
     c = Counter(toks)
     ranked = sorted(c.items(), key=lambda x: (x[1], len(x[0]) >= 4, len(x[0])), reverse=True)
-    out: List[str] = []
+    out = []
     for w, _ in ranked:
         if w not in out:
             out.append(w)
@@ -142,7 +138,7 @@ def top_keywords(text: str, k: int = 12) -> List[str]:
             break
     return out
 
-def find_def_sentence(term: str, sentences: List[str]) -> Optional[str]:
+def find_def_sentence(term, sentences):
     patt = re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
     candidates = [s for s in sentences if patt.search(s)]
     if not candidates:
@@ -151,9 +147,9 @@ def find_def_sentence(term: str, sentences: List[str]) -> Optional[str]:
     def_like = [s for s in candidates if any(c in s.lower() for c in cues)]
     return (def_like[0] if def_like else candidates[0]).strip()
 
-def extract_procedure(text: str) -> List[str]:
+def extract_procedure(text):
     lines = [l.strip() for l in (text or "").splitlines() if l.strip()]
-    proc: List[str] = []
+    proc = []
     step_like = re.compile(r"^(\d+[\)\.\-]|•|\-)\s+|^(primero|segundo|tercero|después|luego|finalmente)\b", re.IGNORECASE)
     for l in lines:
         if step_like.search(l):
@@ -172,11 +168,11 @@ def extract_procedure(text: str) -> List[str]:
 # =========================
 # Generators (heuristics)
 # =========================
-def generate_questions(text: str, n: int = 5) -> List[str]:
+def generate_questions(text, n=5):
     text = clean_text(text)
     sents = split_sentences(text)
     kws = top_keywords(text, k=20)
-    questions: List[str] = []
+    questions = []
 
     for term in kws:
         if len(questions) >= n:
@@ -192,7 +188,7 @@ def generate_questions(text: str, n: int = 5) -> List[str]:
 
     return questions[:n]
 
-def generate_notes(text: str, detail: str) -> str:
+def generate_notes(text, detail):
     text = clean_text(text)
     if not text:
         return "No hay contenido para generar apuntes."
@@ -210,7 +206,7 @@ def generate_notes(text: str, detail: str) -> str:
     proc = extract_procedure(text)
 
     title = " ".join([k.capitalize() for k in kws[:3]]) if kws else "Apuntes"
-    md: List[str] = []
+    md = []
     md.append(f"# {title}\n")
 
     md.append("## Ideas clave")
@@ -241,11 +237,11 @@ def generate_notes(text: str, detail: str) -> str:
 
     return "\n".join(md).strip()
 
-def generate_flashcards(text: str, n: int) -> Dict[str, Any]:
+def generate_flashcards(text, n):
     text = clean_text(text)
     sentences = split_sentences(text)
     kws = top_keywords(text, k=max(12, n))
-    cards: List[Dict[str, Any]] = []
+    cards = []
 
     for term in kws:
         if len(cards) >= n:
@@ -274,7 +270,7 @@ def generate_flashcards(text: str, n: int) -> Dict[str, Any]:
 
     return {"flashcards": cards[:n]}
 
-def generate_quiz(text: str, n: int, difficulty: str) -> Dict[str, Any]:
+def generate_quiz(text, n, difficulty):
     text = clean_text(text)
     sentences = split_sentences(text)
     kws = top_keywords(text, k=40)
@@ -286,7 +282,7 @@ def generate_quiz(text: str, n: int, difficulty: str) -> Dict[str, Any]:
         candidates = sentences[:]
 
     random.shuffle(candidates)
-    quiz: List[Dict[str, Any]] = []
+    quiz = []
     used = set()
 
     for s in candidates:
@@ -321,7 +317,7 @@ def generate_quiz(text: str, n: int, difficulty: str) -> Dict[str, Any]:
 
     return {"quiz": quiz[:n]}
 
-def generate_mindmap_mermaid(text: str) -> str:
+def generate_mindmap_mermaid(text):
     text = clean_text(text)
     if not text:
         return "```mermaid\nmindmap\n  root((Sin contenido))\n```"
@@ -382,7 +378,7 @@ if source == "Texto":
     content = st.text_area("Pega aquí tu texto", height=260, placeholder="Pega apuntes, artículos, etc.")
 else:
     if not PYPDF_OK:
-        st.warning("Para leer PDFs necesitas `pypdf` (no es un modelo, solo lector de PDF).")
+        st.warning("Para leer PDFs necesitas `pypdf` (no es un modelo, solo un lector de PDF).")
     pdf = st.file_uploader("Sube un PDF", type=["pdf"])
     if pdf is not None:
         try:
@@ -404,7 +400,7 @@ if go:
         st.error("No hay contenido. Añade texto o sube un PDF.")
         st.stop()
 
-    results: Dict[str, Any] = {}
+    results = {}
 
     if want_notes:
         with st.spinner("Generando apuntes (NLP clásica)..."):

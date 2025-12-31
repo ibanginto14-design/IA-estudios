@@ -1,524 +1,479 @@
-# app.py
-import os
 import re
-import json
 import io
-import tempfile
+import math
+import json
+import random
+from collections import Counter, defaultdict
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Tuple, Optional
 
 import streamlit as st
 
-APP_BUILD = "build-KEYSIDEBAR-2025-12-31"
-st.sidebar.info(f"✅ Ejecutando: {APP_BUILD}")
-
-# -----------------------------
-# Optional deps (handled gracefully)
-# -----------------------------
+# =========================
+# Optional PDF support
+# =========================
+PYPDF_OK = True
 try:
     from pypdf import PdfReader
-    PYPDF_OK = True
 except Exception:
     PYPDF_OK = False
 
-try:
-    from youtube_transcript_api import YouTubeTranscriptApi
-    YT_OK = True
-except Exception:
-    YT_OK = False
 
-try:
-    import pandas as pd
-    PANDAS_OK = True
-except Exception:
-    PANDAS_OK = False
-
-OPENAI_OK = True
-try:
-    from openai import OpenAI
-except Exception:
-    OPENAI_OK = False
-
-WHISPER_OK = True
-try:
-    import whisper  # pip install -U openai-whisper
-except Exception:
-    WHISPER_OK = False
+# =========================
+# Basic Spanish stopwords (compact)
+# =========================
+STOPWORDS_ES = {
+    "a","acá","ahí","al","algo","algunos","ante","antes","apenas","aquí","así","aun","aunque",
+    "bajo","bien","cada","casi","como","con","contra","cual","cuales","cuando","cuanto","de",
+    "del","desde","donde","dos","el","ella","ellas","ello","ellos","en","entre","era","es",
+    "esa","esas","ese","eso","esos","esta","está","están","estas","este","esto","estos","fue",
+    "ha","hace","hacia","han","hasta","hay","incluso","la","las","le","les","lo","los","más",
+    "me","menos","mi","mis","mucho","muy","nada","ni","no","nos","nuestra","nuestro","o","os",
+    "otra","otro","para","pero","poco","por","porque","que","qué","quien","quienes","se","sea",
+    "ser","si","sí","sin","sobre","solo","su","sus","también","tan","tanto","te","tener","tiene",
+    "todo","todos","tu","tus","un","una","uno","unos","y","ya","yo"
+}
 
 
-# -----------------------------
-# Key / Config helpers
-# -----------------------------
-def get_openai_key() -> str:
-    """
-    Resolución de API Key en orden:
-    1) st.secrets["OPENAI_API_KEY"] (ideal en Streamlit Cloud)
-    2) st.session_state["OPENAI_API_KEY_UI"] (introducida en sidebar)
-    3) variable de entorno OPENAI_API_KEY (local)
-    """
-    key = ""
-
-    # 1) Streamlit Cloud secrets
-    try:
-        if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
-            key = str(st.secrets["OPENAI_API_KEY"]).strip()
-    except Exception:
-        pass
-
-    # 2) UI key
-    if not key:
-        key = (st.session_state.get("OPENAI_API_KEY_UI", "") or "").strip()
-
-    # 3) Env var
-    if not key:
-        key = os.environ.get("OPENAI_API_KEY", "").strip()
-
-    return key
-
-
-# -----------------------------
-# Text helpers
-# -----------------------------
-def _clean_text(t: str) -> str:
+# =========================
+# Text utilities
+# =========================
+def clean_text(t: str) -> str:
     t = (t or "").replace("\x00", " ")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
+def normalize_token(w: str) -> str:
+    w = w.lower()
+    w = re.sub(r"^[^\wáéíóúüñ]+|[^\wáéíóúüñ]+$", "", w, flags=re.UNICODE)
+    return w
 
-def _chunk_text(text: str, max_chars: int = 12000) -> List[str]:
-    text = _clean_text(text)
-    if len(text) <= max_chars:
-        return [text]
-
-    paras = text.split("\n\n")
-    chunks, cur = [], ""
-    for p in paras:
-        p = p.strip()
-        if not p:
+def tokenize_words(text: str) -> List[str]:
+    words = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ0-9]+", text, flags=re.UNICODE)
+    tokens = []
+    for w in words:
+        nw = normalize_token(w)
+        if not nw:
             continue
-        candidate = (cur + "\n\n" + p).strip() if cur else p
-        if len(candidate) <= max_chars:
-            cur = candidate
-        else:
-            if cur:
-                chunks.append(cur)
-            if len(p) > max_chars:
-                for i in range(0, len(p), max_chars):
-                    chunks.append(p[i : i + max_chars])
-                cur = ""
-            else:
-                cur = p
-    if cur:
-        chunks.append(cur)
-    return chunks
+        if nw in STOPWORDS_ES:
+            continue
+        if len(nw) <= 2:
+            continue
+        tokens.append(nw)
+    return tokens
 
+def split_sentences(text: str) -> List[str]:
+    # Simple sentence splitter robust to PDFs
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return []
+    # Split on punctuation followed by space/capital or end
+    parts = re.split(r"(?<=[\.\?\!])\s+(?=[A-ZÁÉÍÓÚÜÑ0-9])", text)
+    # Fallback if PDF had no punctuation: split by long spaces/semicolons
+    if len(parts) <= 1:
+        parts = re.split(r"\s{2,}|;\s+", text)
+    parts = [p.strip() for p in parts if p.strip()]
+    return parts
 
-def _extract_youtube_id(url: str) -> Optional[str]:
-    patterns = [
-        r"v=([A-Za-z0-9_-]{6,})",
-        r"youtu\.be/([A-Za-z0-9_-]{6,})",
-        r"embed/([A-Za-z0-9_-]{6,})",
-        r"shorts/([A-Za-z0-9_-]{6,})",
-    ]
-    for pat in patterns:
-        m = re.search(pat, url)
-        if m:
-            return m.group(1)
-    return None
-
-
-def _pdf_to_text(file_bytes: bytes) -> str:
+def pdf_to_text(file_bytes: bytes) -> str:
     if not PYPDF_OK:
-        raise RuntimeError("Falta dependencia: pypdf. Instala: pip install pypdf")
-
+        raise RuntimeError("PDF no disponible: instala pypdf (ver requirements).")
     bio = io.BytesIO(file_bytes)
     reader = PdfReader(bio)
-    out = []
-    for page in reader.pages:
+    pages = []
+    for p in reader.pages:
         try:
-            out.append(page.extract_text() or "")
+            pages.append(p.extract_text() or "")
         except Exception:
-            out.append("")
-    return _clean_text("\n\n".join(out))
+            pages.append("")
+    return clean_text("\n\n".join(pages))
 
 
-# -----------------------------
-# LLM Provider
-# -----------------------------
-@dataclass
-class LLMConfig:
-    provider: str  # "openai"
-    model: str
-    temperature: float = 0.2
+# =========================
+# Classic NLP scoring
+# =========================
+def tfidf_sentence_scores(sentences: List[str]) -> Tuple[List[float], Dict[str, float]]:
+    """
+    Returns sentence scores and global IDF per token.
+    """
+    if not sentences:
+        return [], {}
+
+    sent_tokens = [tokenize_words(s) for s in sentences]
+    # Document frequency
+    df = Counter()
+    for toks in sent_tokens:
+        for t in set(toks):
+            df[t] += 1
+    N = max(1, len(sentences))
+    idf = {}
+    for t, c in df.items():
+        idf[t] = math.log((N + 1) / (c + 1)) + 1.0  # smoothed
+
+    scores = []
+    for toks in sent_tokens:
+        if not toks:
+            scores.append(0.0)
+            continue
+        tf = Counter(toks)
+        score = 0.0
+        for t, f in tf.items():
+            score += (f / len(toks)) * idf.get(t, 0.0)
+        scores.append(score)
+    return scores, idf
+
+def pick_top_sentences(sentences: List[str], max_sentences: int) -> List[str]:
+    if not sentences:
+        return []
+    scores, _ = tfidf_sentence_scores(sentences)
+    idx = list(range(len(sentences)))
+    idx.sort(key=lambda i: scores[i], reverse=True)
+    chosen = sorted(idx[: max_sentences])  # keep original order
+    return [sentences[i] for i in chosen]
+
+def top_keywords(text: str, k: int = 12) -> List[str]:
+    toks = tokenize_words(text)
+    if not toks:
+        return []
+    c = Counter(toks)
+    # de-bias: prefer medium-length words
+    ranked = sorted(c.items(), key=lambda x: (x[1], len(x[0]) >= 4, len(x[0])), reverse=True)
+    out = []
+    for w, _ in ranked:
+        if w not in out:
+            out.append(w)
+        if len(out) >= k:
+            break
+    return out
+
+def find_def_sentence(term: str, sentences: List[str]) -> Optional[str]:
+    # Prefer sentences that look like definitions
+    patt = re.compile(rf"\b{re.escape(term)}\b", re.IGNORECASE)
+    candidates = [s for s in sentences if patt.search(s)]
+    if not candidates:
+        return None
+    # definition-ish cues
+    cues = ("es ", "son ", "se define", "consiste", "significa", "se entiende")
+    def_like = [s for s in candidates if any(c in s.lower() for c in cues)]
+    return (def_like[0] if def_like else candidates[0]).strip()
+
+def extract_procedure(text: str) -> List[str]:
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    proc = []
+    step_like = re.compile(r"^(\d+[\)\.\-]|•|\-)\s+|^(primero|segundo|tercero|después|luego|finalmente)\b", re.IGNORECASE)
+    for l in lines:
+        if step_like.search(l):
+            proc.append(l)
+    # If nothing matched, try sentences with "paso"
+    if not proc:
+        sents = split_sentences(text)
+        for s in sents:
+            if "paso" in s.lower() or "pasos" in s.lower():
+                proc.append(s.strip())
+                if len(proc) >= 6:
+                    break
+    return proc[:10]
 
 
-class LLM:
-    def __init__(self, cfg: LLMConfig):
-        self.cfg = cfg
+# =========================
+# Generators (heuristics)
+# =========================
+def generate_notes(text: str, detail: str) -> str:
+    text = clean_text(text)
+    if not text:
+        return "No hay contenido para generar apuntes."
 
-        if cfg.provider != "openai":
-            raise RuntimeError("Provider no soportado.")
+    sentences = split_sentences(text)
+    kws = top_keywords(text, k=12)
 
-        if not OPENAI_OK:
-            raise RuntimeError("No se pudo importar openai. Instala: pip install openai")
+    # Choose number of sentences based on detail
+    if detail == "breve":
+        n = 6
+    elif detail == "exhaustivo":
+        n = 16
+    else:
+        n = 10
 
-        api_key = get_openai_key()
-        if not api_key:
-            raise RuntimeError("Falta OPENAI_API_KEY (env, secrets o sidebar).")
+    key_sents = pick_top_sentences(sentences, n)
+    proc = extract_procedure(text)
 
-        self.client = OpenAI(api_key=api_key)
+    # Build Markdown
+    title = " ".join([k.capitalize() for k in kws[:3]]) if kws else "Apuntes"
+    md = []
+    md.append(f"# {title}\n")
 
-    def chat(self, system: str, user: str) -> str:
-        resp = self.client.chat.completions.create(
-            model=self.cfg.model,
-            temperature=self.cfg.temperature,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-        )
-        return (resp.choices[0].message.content or "").strip()
+    md.append("## Ideas clave")
+    for s in key_sents:
+        md.append(f"- {s}")
 
+    if proc:
+        md.append("\n## Procedimiento")
+        for p in proc:
+            md.append(f"- {p}")
 
-# -----------------------------
-# Prompts
-# -----------------------------
-SYS_STUDY = """Eres un asistente experto en tomar apuntes.
-Tu objetivo es convertir contenido bruto en materiales de estudio claros, estructurados y útiles.
-No inventes datos: si algo no aparece en el texto, indícalo como 'no especificado' o 'no consta'.
-Usa español neutro y Markdown limpio.
-"""
+    # Glossary
+    md.append("\n## Glosario (términos clave)")
+    for term in kws[:10]:
+        ds = find_def_sentence(term, sentences)
+        if ds:
+            md.append(f"- **{term}**: {ds}")
+        else:
+            md.append(f"- **{term}**: (no consta una definición explícita en el texto)")
 
-def prompt_notes(text: str, level: str) -> str:
-    return f"""
-Convierte el siguiente contenido en APUNTES para estudiar.
+    # 10-line summary
+    md.append("\n## Resumen en 10 líneas")
+    sum_sents = pick_top_sentences(sentences, 10)
+    for s in sum_sents[:10]:
+        md.append(f"- {s}")
 
-Requisitos:
-- Nivel de detalle: {level} (breve / medio / exhaustivo)
-- Estructura con títulos, viñetas, y una sección final de 'Resumen en 10 líneas'
-- Añade un glosario corto de términos clave (máx 10)
-- Si el texto incluye pasos/procesos, crea un apartado 'Procedimiento'
-- Incluye 5 preguntas de repaso al final (sin respuestas)
+    # Review questions
+    md.append("\n## Preguntas de repaso (sin respuestas)")
+    qs = generate_questions(text, n=5)
+    for q in qs:
+        md.append(f"- {q}")
 
-TEXTO:
-\"\"\"{text}\"\"\"
-""".strip()
-
-def prompt_flashcards(text: str, n: int) -> str:
-    return f"""
-Crea {n} FLASHCARDS a partir del texto.
-Devuélvelas en JSON estricto con esta forma:
-{{
-  "flashcards":[
-    {{"front":"...", "back":"...", "tags":["...","..."]}}
-  ]
-}}
-- 'front' debe ser una pregunta o concepto
-- 'back' debe ser la respuesta explicada en 1-3 frases
-- tags: 1-3 etiquetas cortas
-TEXTO:
-\"\"\"{text}\"\"\"
-""".strip()
-
-def prompt_quiz(text: str, n: int, difficulty: str) -> str:
-    return f"""
-Crea un QUIZ tipo test de {n} preguntas (dificultad: {difficulty}) a partir del texto.
-Devuelve JSON estricto:
-{{
-  "quiz":[
-    {{
-      "question":"...",
-      "options":["A","B","C","D"],
-      "answer_index": 0,
-      "explanation":"..."
-    }}
-  ]
-}}
-Reglas:
-- 4 opciones por pregunta
-- Solo 1 correcta
-- Explicación breve basada en el texto
-TEXTO:
-\"\"\"{text}\"\"\"
-""".strip()
-
-def prompt_mindmap(text: str) -> str:
-    return f"""
-Genera un mapa mental en formato Mermaid (mindmap) basado en el texto.
-Devuelve SOLO el bloque mermaid, sin texto adicional.
-Debe ser legible y no excesivamente largo (máx 60 nodos).
-TEXTO:
-\"\"\"{text}\"\"\"
-""".strip()
+    return "\n".join(md).strip()
 
 
-# -----------------------------
-# Transcription
-# -----------------------------
-def transcribe_audio_openai(audio_path: str, model: str = "whisper-1") -> str:
-    if not OPENAI_OK:
-        raise RuntimeError("No se pudo importar openai. Instala: pip install openai")
+def generate_flashcards(text: str, n: int) -> Dict[str, Any]:
+    text = clean_text(text)
+    sentences = split_sentences(text)
+    kws = top_keywords(text, k=max(12, n))
+    cards = []
 
-    api_key = get_openai_key()
-    if not api_key:
-        raise RuntimeError("Falta OPENAI_API_KEY (env, secrets o sidebar).")
+    # Prefer definitional cards first
+    for term in kws:
+        if len(cards) >= n:
+            break
+        ds = find_def_sentence(term, sentences)
+        if ds:
+            cards.append({
+                "front": f"¿Qué es {term}?",
+                "back": ds,
+                "tags": [term]
+            })
 
-    client = OpenAI(api_key=api_key)
-    with open(audio_path, "rb") as f:
-        resp = client.audio.transcriptions.create(model=model, file=f)
-    return _clean_text(getattr(resp, "text", "") or "")
+    # Fill with cloze cards
+    if len(cards) < n:
+        pool = [s for s in sentences if len(tokenize_words(s)) >= 6]
+        random.shuffle(pool)
+        distract_terms = kws[:]
+        for s in pool:
+            if len(cards) >= n:
+                break
+            toks = tokenize_words(s)
+            if not toks:
+                continue
+            # choose a keyword present in sentence
+            present = [t for t in toks if t in distract_terms]
+            if not present:
+                continue
+            target = present[0]
+            cloze = re.sub(rf"\b{re.escape(target)}\b", "_____", s, flags=re.IGNORECASE)
+            cards.append({
+                "front": f"Completa: {cloze}",
+                "back": f"La palabra clave era **{target}**. Contexto: {s}",
+                "tags": [target]
+            })
 
-
-def transcribe_audio_local(audio_path: str, model_size: str = "base") -> str:
-    if not WHISPER_OK:
-        raise RuntimeError("No tienes whisper local instalado. pip install -U openai-whisper")
-    m = whisper.load_model(model_size)
-    r = m.transcribe(audio_path)
-    return _clean_text(r.get("text", ""))
-
-
-# -----------------------------
-# JSON parsing helper
-# -----------------------------
-def safe_parse_json(s: str) -> Dict[str, Any]:
-    s = (s or "").strip()
-    s = re.sub(r"^```json\s*", "", s)
-    s = re.sub(r"^```\s*", "", s)
-    s = re.sub(r"\s*```$", "", s)
-    try:
-        return json.loads(s)
-    except Exception:
-        m = re.search(r"(\{.*\})", s, flags=re.DOTALL)
-        if m:
-            return json.loads(m.group(1))
-        raise
-
-
-# -----------------------------
-# Study pipeline
-# -----------------------------
-def summarize_chunks(llm: LLM, chunks: List[str], detail_level: str) -> str:
-    if len(chunks) == 1:
-        return llm.chat(SYS_STUDY, prompt_notes(chunks[0], detail_level))
-
-    partial_notes = []
-    for i, ch in enumerate(chunks, start=1):
-        partial = llm.chat(SYS_STUDY, f"[Parte {i}/{len(chunks)}]\n\n{prompt_notes(ch, 'medio')}")
-        partial_notes.append(partial)
-
-    merged = "\n\n---\n\n".join(partial_notes)
-    final = llm.chat(
-        SYS_STUDY,
-        f"""
-Une y depura estos apuntes parciales en unos APUNTES FINALES coherentes (sin repeticiones).
-- Mantén estructura clara
-- Mejora el orden
-- Conserva precisión
-
-APUNTES PARCIALES:
-\"\"\"{merged}\"\"\"
-""".strip(),
-    )
-    return final
+    return {"flashcards": cards[:n]}
 
 
-def build_condensed_context(llm: LLM, chunks: List[str]) -> str:
-    if len(chunks) == 1:
-        return chunks[0]
+def generate_quiz(text: str, n: int, difficulty: str) -> Dict[str, Any]:
+    text = clean_text(text)
+    sentences = split_sentences(text)
+    kws = top_keywords(text, k=40)
+    if not sentences or not kws:
+        return {"quiz": []}
 
-    condensed_parts = []
-    for i, ch in enumerate(chunks, start=1):
-        part_sum = llm.chat(
-            SYS_STUDY,
-            f"""
-Resume esta parte en puntos clave (máx 15 viñetas), sin inventar.
-PARTE {i}/{len(chunks)}:
-\"\"\"{ch}\"\"\"
-""".strip(),
-        )
-        condensed_parts.append(part_sum)
-    return _clean_text("\n\n".join(condensed_parts))
+    # pick candidate sentences by length/complexity
+    candidates = [s for s in sentences if 8 <= len(tokenize_words(s)) <= 28]
+    if not candidates:
+        candidates = sentences[:]
+
+    # difficulty affects question count per sentence and distractor closeness (simple here)
+    random.shuffle(candidates)
+    quiz = []
+    used = set()
+
+    for s in candidates:
+        if len(quiz) >= n:
+            break
+
+        toks = tokenize_words(s)
+        present = [t for t in toks if t in kws]
+        if not present:
+            continue
+
+        target = present[0]
+        key = (target, s[:60])
+        if key in used:
+            continue
+        used.add(key)
+
+        # options
+        distractors = [k for k in kws if k != target]
+        random.shuffle(distractors)
+
+        # Choose distractors: for "difícil" prefer same-length distractors
+        if difficulty == "difícil":
+            distractors.sort(key=lambda x: abs(len(x) - len(target)))
+        opts = [target] + distractors[:3]
+        random.shuffle(opts)
+
+        cloze = re.sub(rf"\b{re.escape(target)}\b", "_____", s, flags=re.IGNORECASE)
+        q = {
+            "question": f"Completa la frase: {cloze}",
+            "options": opts,
+            "answer_index": opts.index(target),
+            "explanation": f"En el texto aparece: {s}"
+        }
+        quiz.append(q)
+
+    return {"quiz": quiz[:n]}
 
 
-# -----------------------------
+def generate_questions(text: str, n: int = 5) -> List[str]:
+    text = clean_text(text)
+    sents = split_sentences(text)
+    kws = top_keywords(text, k=20)
+    questions = []
+
+    # definitional questions
+    for term in kws[:]:
+        if len(questions) >= n:
+            break
+        questions.append(f"¿Cómo definirías {term} según el texto?")
+
+    # add "why/how" from sentences with cues
+    cues = ["porque", "por qué", "para", "objetivo", "consiste", "permite", "provoca", "evita"]
+    for s in sents:
+        if len(questions) >= n:
+            break
+        if any(c in s.lower() for c in cues):
+            questions.append(f"Explica esta idea con tus palabras: “{s}”")
+
+    return questions[:n]
+
+
+def generate_mindmap_mermaid(text: str) -> str:
+    text = clean_text(text)
+    if not text:
+        return "```mermaid\nmindmap\n  root((Sin contenido))\n```"
+
+    kws = top_keywords(text, k=18)
+    root = kws[0].capitalize() if kws else "Tema"
+    sents = split_sentences(text)
+
+    # simple co-occurrence: for each keyword, collect neighbor keywords in same sentence
+    co = defaultdict(Counter)
+    for s in sents:
+        toks = set(tokenize_words(s))
+        present = [k for k in kws if k in toks]
+        for a in present:
+            for b in present:
+                if a != b:
+                    co[a][b] += 1
+
+    lines = ["```mermaid", "mindmap", f"  root(({root}))"]
+    for k in kws[1:7]:
+        lines.append(f"    {k}")
+        # add up to 2 subnodes
+        for sub, _ in co[k].most_common(2):
+            lines.append(f"      {sub}")
+
+    lines.append("```")
+    return "\n".join(lines)
+
+
+# =========================
 # UI
-# -----------------------------
-st.set_page_config(page_title="StudyWave (tipo ThetaWave)", page_icon="🧠", layout="wide")
+# =========================
+st.set_page_config(page_title="StudyWave (sin API)", page_icon="🧠", layout="wide")
+st.title("🧠 StudyWave — Apuntes + Flashcards + Quiz + Mindmap (SIN API)")
 
-# ensure session key exists
-st.session_state.setdefault("OPENAI_API_KEY_UI", "")
-
-st.title("🧠 StudyWave — Apuntes + Flashcards + Quiz + Mindmap (tipo ThetaWave)")
+st.info(
+    "Esta versión NO usa ChatGPT ni modelos en la nube. "
+    "Funciona sin API y sin descargar modelos, usando NLP clásica (resumen extractivo + heurísticas)."
+)
 
 with st.sidebar:
-    st.header("🔑 API Key")
-    api_key_ui = st.text_input(
-        "OpenAI API Key (opcional)",
-        type="password",
-        value=st.session_state.get("OPENAI_API_KEY_UI", ""),
-        help="Se usa solo en esta sesión del navegador. En Streamlit Cloud, mejor usar Secrets.",
-    )
-    st.session_state["OPENAI_API_KEY_UI"] = (api_key_ui or "").strip()
-
-    # quick status
-    resolved = get_openai_key()
-    if resolved:
-        st.success("API Key detectada ✅")
-    else:
-        st.warning("No hay API Key. Añádela aquí, en Secrets o en variable de entorno.")
+    st.header("📥 Fuente")
+    source = st.radio("Selecciona fuente", ["Texto", "PDF"], index=1)
 
     st.divider()
-
-    st.header("⚙️ Configuración LLM")
-    provider = st.selectbox("Proveedor", ["openai"], index=0)
-    model = st.text_input("Modelo", value="gpt-4o-mini")
-    temperature = st.slider("Temperatura", 0.0, 1.0, 0.2, 0.05)
-
-    st.divider()
-    st.subheader("📥 Fuente de contenido")
-    source = st.radio("Selecciona fuente", ["Texto", "PDF", "Audio", "YouTube"], index=1)
+    st.header("🎯 Salidas")
+    want_notes = st.checkbox("Generar apuntes", True)
+    want_flashcards = st.checkbox("Generar flashcards", True)
+    want_quiz = st.checkbox("Generar quiz", True)
+    want_mindmap = st.checkbox("Generar mindmap (Mermaid)", True)
 
     st.divider()
-    st.subheader("🎯 Salidas")
-    want_notes = st.checkbox("Generar apuntes", value=True)
-    want_flashcards = st.checkbox("Generar flashcards", value=True)
-    want_quiz = st.checkbox("Generar quiz", value=True)
-    want_mindmap = st.checkbox("Generar mindmap (Mermaid)", value=True)
-
     detail = st.selectbox("Nivel de apuntes", ["breve", "medio", "exhaustivo"], index=1)
     n_flash = st.slider("Nº flashcards", 5, 60, 20, 1)
     n_quiz = st.slider("Nº preguntas quiz", 5, 40, 12, 1)
     quiz_diff = st.selectbox("Dificultad quiz", ["fácil", "media", "difícil"], index=1)
 
-    st.caption("Tip: si el texto es enorme, la app lo trocea y fusiona resultados.")
-
-
 content = ""
-meta = {}
 
 if source == "Texto":
-    content = st.text_area("Pega aquí tu texto", height=260, placeholder="Apuntes, artículos, etc.")
-elif source == "PDF":
+    content = st.text_area("Pega aquí tu texto", height=260, placeholder="Pega apuntes, artículos, etc.")
+else:
     if not PYPDF_OK:
-        st.warning("Para PDF necesitas: `pip install pypdf`")
+        st.warning("Para leer PDFs necesitas instalar `pypdf`. (No es un modelo, solo un lector de PDF).")
     pdf = st.file_uploader("Sube un PDF", type=["pdf"])
     if pdf is not None:
         try:
-            content = _pdf_to_text(pdf.read())
-            meta["pdf_name"] = pdf.name
-            st.success(f"PDF cargado: {pdf.name} ({len(content):,} caracteres extraídos)")
+            b = pdf.read()
+            if not PYPDF_OK:
+                content = ""
+                st.error("No puedo leer el PDF porque falta `pypdf`. Añádelo a requirements.txt.")
+            else:
+                content = pdf_to_text(b)
+                st.success(f"PDF cargado: {pdf.name} ({len(content):,} caracteres extraídos)")
         except Exception as e:
-            st.error(f"No se pudo extraer texto del PDF: {e}")
-elif source == "Audio":
-    audio = st.file_uploader("Sube un audio", type=["mp3", "wav", "m4a", "aac", "ogg", "flac"])
-    st.caption("Transcripción: OpenAI (recomendado) o Whisper local (si lo tienes instalado).")
-    stt_mode = st.radio("Modo de transcripción", ["OpenAI", "Whisper local"], index=0, horizontal=True)
-
-    if audio is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{audio.name}") as tmp:
-            tmp.write(audio.read())
-            audio_path = tmp.name
-
-        if st.button("🎙️ Transcribir audio", type="primary"):
-            try:
-                with st.spinner("Transcribiendo..."):
-                    if stt_mode == "OpenAI":
-                        content = transcribe_audio_openai(audio_path, model="whisper-1")
-                    else:
-                        content = transcribe_audio_local(audio_path, model_size="base")
-                st.success(f"Transcripción lista ({len(content):,} caracteres)")
-                st.text_area("Transcripción", value=content, height=220)
-            except Exception as e:
-                st.error(f"Error transcribiendo: {e}")
-elif source == "YouTube":
-    if not YT_OK:
-        st.warning("Para transcripción YouTube necesitas: `pip install youtube-transcript-api`")
-    url = st.text_input("URL de YouTube", placeholder="https://www.youtube.com/watch?v=...")
-    if url and st.button("📼 Obtener transcript", type="primary"):
-        try:
-            vid = _extract_youtube_id(url)
-            if not vid:
-                raise RuntimeError("No pude detectar el ID del vídeo. Prueba con otro enlace.")
-            with st.spinner("Descargando transcript..."):
-                transcript = YouTubeTranscriptApi.get_transcript(vid)
-            content = _clean_text(" ".join([x.get("text", "") for x in transcript]))
-            meta["youtube_id"] = vid
-            st.success(f"Transcript listo ({len(content):,} caracteres)")
-            st.text_area("Transcript", value=content, height=220)
-        except Exception as e:
-            st.error(f"Error obteniendo transcript: {e}")
+            st.error(f"Error leyendo PDF: {e}")
 
 st.divider()
-colA, colB = st.columns([1, 2])
-with colA:
-    go = st.button("✨ Generar materiales", type="primary", use_container_width=True)
-with colB:
-    st.caption("Si falla el JSON de flashcards/quiz, baja la temperatura o reduce el tamaño del texto.")
+go = st.button("✨ Generar materiales", type="primary", use_container_width=True)
 
 if go:
     if not content.strip():
-        st.error("No hay contenido. Añade texto / sube un PDF / transcribe audio / añade un YouTube.")
+        st.error("No hay contenido. Añade texto o sube un PDF.")
         st.stop()
 
-    try:
-        llm = LLM(LLMConfig(provider=provider, model=model, temperature=temperature))
-    except Exception as e:
-        st.error(str(e))
-        st.stop()
-
-    chunks = _chunk_text(content, max_chars=12000)
     results: Dict[str, Any] = {}
 
     if want_notes:
-        with st.spinner("Generando apuntes..."):
-            results["notes_md"] = summarize_chunks(llm, chunks, detail)
-
-    # Context condensed for stable JSON outputs when content is large
-    if len(chunks) > 1 and (want_flashcards or want_quiz or want_mindmap):
-        with st.spinner("Condensando contenido para flashcards/quiz/mindmap..."):
-            study_context = build_condensed_context(llm, chunks)
-    else:
-        study_context = content
+        with st.spinner("Generando apuntes (NLP clásica)..."):
+            results["notes_md"] = generate_notes(content, detail)
 
     if want_flashcards:
         with st.spinner("Generando flashcards..."):
-            raw = llm.chat(SYS_STUDY, prompt_flashcards(study_context, n_flash))
-            try:
-                results["flashcards_json"] = safe_parse_json(raw)
-            except Exception:
-                raw2 = llm.chat(SYS_STUDY, "Devuelve SOLO JSON válido. Sin markdown.\n\n" + prompt_flashcards(study_context, n_flash))
-                results["flashcards_json"] = safe_parse_json(raw2)
+            results["flashcards_json"] = generate_flashcards(content, n_flash)
 
     if want_quiz:
         with st.spinner("Generando quiz..."):
-            raw = llm.chat(SYS_STUDY, prompt_quiz(study_context, n_quiz, quiz_diff))
-            try:
-                results["quiz_json"] = safe_parse_json(raw)
-            except Exception:
-                raw2 = llm.chat(SYS_STUDY, "Devuelve SOLO JSON válido. Sin markdown.\n\n" + prompt_quiz(study_context, n_quiz, quiz_diff))
-                results["quiz_json"] = safe_parse_json(raw2)
+            results["quiz_json"] = generate_quiz(content, n_quiz, quiz_diff)
 
     if want_mindmap:
-        with st.spinner("Generando mindmap (Mermaid)..."):
-            mm = llm.chat(SYS_STUDY, prompt_mindmap(study_context))
-            if "```" not in mm:
-                mm = "```mermaid\n" + mm.strip() + "\n```"
-            results["mindmap_md"] = mm
+        with st.spinner("Generando mindmap..."):
+            results["mindmap_md"] = generate_mindmap_mermaid(content)
 
     st.success("Listo ✅")
 
-    tab_labels = []
-    if want_notes: tab_labels.append("📚 Apuntes")
-    if want_flashcards: tab_labels.append("🃏 Flashcards")
-    if want_quiz: tab_labels.append("📝 Quiz")
-    if want_mindmap: tab_labels.append("🧩 Mindmap")
+    tabs = []
+    if want_notes: tabs.append("📚 Apuntes")
+    if want_flashcards: tabs.append("🃏 Flashcards")
+    if want_quiz: tabs.append("📝 Quiz")
+    if want_mindmap: tabs.append("🧩 Mindmap")
 
-    tabs = st.tabs(tab_labels) if tab_labels else []
-    t = 0
+    tab_objs = st.tabs(tabs) if tabs else []
+    ti = 0
 
     if want_notes:
-        with tabs[t]:
+        with tab_objs[ti]:
             st.markdown(results["notes_md"])
             st.download_button(
                 "⬇️ Descargar apuntes (.md)",
@@ -526,46 +481,33 @@ if go:
                 file_name="apuntes.md",
                 mime="text/markdown",
             )
-        t += 1
+        ti += 1
 
     if want_flashcards:
-        with tabs[t]:
-            fc = results.get("flashcards_json", {}).get("flashcards", [])
+        with tab_objs[ti]:
+            fc = results["flashcards_json"].get("flashcards", [])
             st.subheader(f"Flashcards ({len(fc)})")
-            if PANDAS_OK and fc:
-                df = pd.DataFrame(fc)
-                st.dataframe(df, use_container_width=True, hide_index=True)
-                st.download_button(
-                    "⬇️ Descargar flashcards (.csv)",
-                    data=df.to_csv(index=False).encode("utf-8"),
-                    file_name="flashcards.csv",
-                    mime="text/csv",
-                )
-            else:
-                st.json(results.get("flashcards_json", {}))
-
+            st.json(results["flashcards_json"])
             st.download_button(
                 "⬇️ Descargar flashcards (.json)",
-                data=json.dumps(results.get("flashcards_json", {}), ensure_ascii=False, indent=2).encode("utf-8"),
+                data=json.dumps(results["flashcards_json"], ensure_ascii=False, indent=2).encode("utf-8"),
                 file_name="flashcards.json",
                 mime="application/json",
             )
-        t += 1
+        ti += 1
 
     if want_quiz:
-        with tabs[t]:
-            q = results.get("quiz_json", {}).get("quiz", [])
+        with tab_objs[ti]:
+            q = results["quiz_json"].get("quiz", [])
             st.subheader(f"Quiz ({len(q)})")
-
             score = 0
             answered = 0
             for i, item in enumerate(q, start=1):
                 st.markdown(f"**{i}. {item.get('question','')}**")
                 opts = item.get("options", [])
-                if not opts or len(opts) != 4:
-                    st.warning("Pregunta con opciones inválidas. Revisa el JSON.")
+                if len(opts) != 4:
+                    st.warning("Pregunta inválida (opciones).")
                     continue
-
                 choice = st.radio(
                     label=f"Respuesta {i}",
                     options=list(range(4)),
@@ -575,7 +517,6 @@ if go:
                 answered += 1
                 if choice == int(item.get("answer_index", -1)):
                     score += 1
-
                 with st.expander("Ver explicación"):
                     st.write(item.get("explanation", ""))
                 st.divider()
@@ -585,16 +526,15 @@ if go:
 
             st.download_button(
                 "⬇️ Descargar quiz (.json)",
-                data=json.dumps(results.get("quiz_json", {}), ensure_ascii=False, indent=2).encode("utf-8"),
+                data=json.dumps(results["quiz_json"], ensure_ascii=False, indent=2).encode("utf-8"),
                 file_name="quiz.json",
                 mime="application/json",
             )
-        t += 1
+        ti += 1
 
     if want_mindmap:
-        with tabs[t]:
-            st.subheader("Mindmap en Mermaid")
-            st.markdown("Pégalo en un visor Mermaid (o en Markdown compatible con Mermaid).")
+        with tab_objs[ti]:
+            st.subheader("Mindmap (Mermaid)")
             st.code(results["mindmap_md"], language="markdown")
             st.download_button(
                 "⬇️ Descargar mindmap (.md)",
@@ -602,19 +542,3 @@ if go:
                 file_name="mindmap.md",
                 mime="text/markdown",
             )
-
-st.divider()
-with st.expander("📦 Requisitos recomendados (pip)"):
-    st.markdown(
-        """
-- streamlit
-- openai
-- pypdf
-- youtube-transcript-api
-- pandas
-
-Opcional:
-- openai-whisper (si quieres transcripción local)
-        """.strip()
-    )
-

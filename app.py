@@ -9,6 +9,9 @@ from typing import List, Dict, Any, Optional
 
 import streamlit as st
 
+APP_BUILD = "build-KEYSIDEBAR-2025-12-31"
+st.sidebar.info(f"✅ Ejecutando: {APP_BUILD}")
+
 # -----------------------------
 # Optional deps (handled gracefully)
 # -----------------------------
@@ -614,3 +617,4 @@ Opcional:
 - openai-whisper (si quieres transcripción local)
         """.strip()
     )
+

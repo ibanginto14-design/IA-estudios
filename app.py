@@ -2,15 +2,15 @@
 import os
 import re
 import json
-import math
+import io
 import tempfile
 from dataclasses import dataclass
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional
 
 import streamlit as st
 
 # -----------------------------
-# Optional deps (we handle missing gracefully)
+# Optional deps (handled gracefully)
 # -----------------------------
 try:
     from pypdf import PdfReader
@@ -30,14 +30,12 @@ try:
 except Exception:
     PANDAS_OK = False
 
-# OpenAI client (recommended path)
 OPENAI_OK = True
 try:
     from openai import OpenAI
 except Exception:
     OPENAI_OK = False
 
-# Local whisper (optional)
 WHISPER_OK = True
 try:
     import whisper  # pip install -U openai-whisper
@@ -46,17 +44,46 @@ except Exception:
 
 
 # -----------------------------
-# Helpers
+# Key / Config helpers
+# -----------------------------
+def get_openai_key() -> str:
+    """
+    Resolución de API Key en orden:
+    1) st.secrets["OPENAI_API_KEY"] (ideal en Streamlit Cloud)
+    2) st.session_state["OPENAI_API_KEY_UI"] (introducida en sidebar)
+    3) variable de entorno OPENAI_API_KEY (local)
+    """
+    key = ""
+
+    # 1) Streamlit Cloud secrets
+    try:
+        if hasattr(st, "secrets") and "OPENAI_API_KEY" in st.secrets:
+            key = str(st.secrets["OPENAI_API_KEY"]).strip()
+    except Exception:
+        pass
+
+    # 2) UI key
+    if not key:
+        key = (st.session_state.get("OPENAI_API_KEY_UI", "") or "").strip()
+
+    # 3) Env var
+    if not key:
+        key = os.environ.get("OPENAI_API_KEY", "").strip()
+
+    return key
+
+
+# -----------------------------
+# Text helpers
 # -----------------------------
 def _clean_text(t: str) -> str:
-    t = t.replace("\x00", " ")
+    t = (t or "").replace("\x00", " ")
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
 
 def _chunk_text(text: str, max_chars: int = 12000) -> List[str]:
-    """Simple char-based chunking with paragraph boundaries."""
     text = _clean_text(text)
     if len(text) <= max_chars:
         return [text]
@@ -73,7 +100,6 @@ def _chunk_text(text: str, max_chars: int = 12000) -> List[str]:
         else:
             if cur:
                 chunks.append(cur)
-            # if single paragraph too large, hard split
             if len(p) > max_chars:
                 for i in range(0, len(p), max_chars):
                     chunks.append(p[i : i + max_chars])
@@ -86,7 +112,6 @@ def _chunk_text(text: str, max_chars: int = 12000) -> List[str]:
 
 
 def _extract_youtube_id(url: str) -> Optional[str]:
-    # Supports: https://www.youtube.com/watch?v=ID, https://youtu.be/ID, embed, shorts
     patterns = [
         r"v=([A-Za-z0-9_-]{6,})",
         r"youtu\.be/([A-Za-z0-9_-]{6,})",
@@ -103,9 +128,11 @@ def _extract_youtube_id(url: str) -> Optional[str]:
 def _pdf_to_text(file_bytes: bytes) -> str:
     if not PYPDF_OK:
         raise RuntimeError("Falta dependencia: pypdf. Instala: pip install pypdf")
-    reader = PdfReader(file_bytes)
+
+    bio = io.BytesIO(file_bytes)
+    reader = PdfReader(bio)
     out = []
-    for i, page in enumerate(reader.pages):
+    for page in reader.pages:
         try:
             out.append(page.extract_text() or "")
         except Exception:
@@ -126,28 +153,29 @@ class LLMConfig:
 class LLM:
     def __init__(self, cfg: LLMConfig):
         self.cfg = cfg
-        if cfg.provider == "openai":
-            if not OPENAI_OK:
-                raise RuntimeError("No se pudo importar openai. Instala: pip install openai")
-            api_key = os.environ.get("OPENAI_API_KEY", "").strip()
-            if not api_key:
-                raise RuntimeError("Falta OPENAI_API_KEY en variables de entorno.")
-            self.client = OpenAI(api_key=api_key)
-        else:
+
+        if cfg.provider != "openai":
             raise RuntimeError("Provider no soportado.")
 
+        if not OPENAI_OK:
+            raise RuntimeError("No se pudo importar openai. Instala: pip install openai")
+
+        api_key = get_openai_key()
+        if not api_key:
+            raise RuntimeError("Falta OPENAI_API_KEY (env, secrets o sidebar).")
+
+        self.client = OpenAI(api_key=api_key)
+
     def chat(self, system: str, user: str) -> str:
-        if self.cfg.provider == "openai":
-            resp = self.client.chat.completions.create(
-                model=self.cfg.model,
-                temperature=self.cfg.temperature,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-            )
-            return resp.choices[0].message.content.strip()
-        raise RuntimeError("Provider no soportado.")
+        resp = self.client.chat.completions.create(
+            model=self.cfg.model,
+            temperature=self.cfg.temperature,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        return (resp.choices[0].message.content or "").strip()
 
 
 # -----------------------------
@@ -227,20 +255,16 @@ TEXTO:
 # -----------------------------
 def transcribe_audio_openai(audio_path: str, model: str = "whisper-1") -> str:
     if not OPENAI_OK:
-        raise RuntimeError("No se pudo importar openai.")
-    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+        raise RuntimeError("No se pudo importar openai. Instala: pip install openai")
+
+    api_key = get_openai_key()
     if not api_key:
-        raise RuntimeError("Falta OPENAI_API_KEY.")
+        raise RuntimeError("Falta OPENAI_API_KEY (env, secrets o sidebar).")
+
     client = OpenAI(api_key=api_key)
     with open(audio_path, "rb") as f:
-        # OpenAI API: audio transcriptions
-        # Note: model names may vary by account; whisper-1 is a common baseline.
-        resp = client.audio.transcriptions.create(
-            model=model,
-            file=f,
-        )
-    # resp.text is typical
-    return _clean_text(getattr(resp, "text", str(resp)))
+        resp = client.audio.transcriptions.create(model=model, file=f)
+    return _clean_text(getattr(resp, "text", "") or "")
 
 
 def transcribe_audio_local(audio_path: str, model_size: str = "base") -> str:
@@ -252,17 +276,32 @@ def transcribe_audio_local(audio_path: str, model_size: str = "base") -> str:
 
 
 # -----------------------------
+# JSON parsing helper
+# -----------------------------
+def safe_parse_json(s: str) -> Dict[str, Any]:
+    s = (s or "").strip()
+    s = re.sub(r"^```json\s*", "", s)
+    s = re.sub(r"^```\s*", "", s)
+    s = re.sub(r"\s*```$", "", s)
+    try:
+        return json.loads(s)
+    except Exception:
+        m = re.search(r"(\{.*\})", s, flags=re.DOTALL)
+        if m:
+            return json.loads(m.group(1))
+        raise
+
+
+# -----------------------------
 # Study pipeline
 # -----------------------------
 def summarize_chunks(llm: LLM, chunks: List[str], detail_level: str) -> str:
-    """Summarize each chunk into notes, then merge into final cohesive notes."""
     if len(chunks) == 1:
         return llm.chat(SYS_STUDY, prompt_notes(chunks[0], detail_level))
 
     partial_notes = []
     for i, ch in enumerate(chunks, start=1):
-        user = prompt_notes(ch, detail_level="medio")
-        partial = llm.chat(SYS_STUDY, f"[Parte {i}/{len(chunks)}]\n\n{user}")
+        partial = llm.chat(SYS_STUDY, f"[Parte {i}/{len(chunks)}]\n\n{prompt_notes(ch, 'medio')}")
         partial_notes.append(partial)
 
     merged = "\n\n---\n\n".join(partial_notes)
@@ -281,39 +320,61 @@ APUNTES PARCIALES:
     return final
 
 
-def safe_parse_json(s: str) -> Dict[str, Any]:
-    # Try to extract JSON if model wrapped it
-    s = s.strip()
-    # Remove markdown fences if present
-    s = re.sub(r"^```json\s*", "", s)
-    s = re.sub(r"^```\s*", "", s)
-    s = re.sub(r"\s*```$", "", s)
-    try:
-        return json.loads(s)
-    except Exception:
-        # last resort: find first {...} block
-        m = re.search(r"(\{.*\})", s, flags=re.DOTALL)
-        if m:
-            return json.loads(m.group(1))
-        raise
+def build_condensed_context(llm: LLM, chunks: List[str]) -> str:
+    if len(chunks) == 1:
+        return chunks[0]
+
+    condensed_parts = []
+    for i, ch in enumerate(chunks, start=1):
+        part_sum = llm.chat(
+            SYS_STUDY,
+            f"""
+Resume esta parte en puntos clave (máx 15 viñetas), sin inventar.
+PARTE {i}/{len(chunks)}:
+\"\"\"{ch}\"\"\"
+""".strip(),
+        )
+        condensed_parts.append(part_sum)
+    return _clean_text("\n\n".join(condensed_parts))
 
 
 # -----------------------------
 # UI
 # -----------------------------
-st.set_page_config(page_title="ThetaWave-like Study AI (Streamlit)", page_icon="🧠", layout="wide")
+st.set_page_config(page_title="StudyWave (tipo ThetaWave)", page_icon="🧠", layout="wide")
+
+# ensure session key exists
+st.session_state.setdefault("OPENAI_API_KEY_UI", "")
 
 st.title("🧠 StudyWave — Apuntes + Flashcards + Quiz + Mindmap (tipo ThetaWave)")
 
 with st.sidebar:
-    st.header("⚙️ Configuración")
-    provider = st.selectbox("Proveedor LLM", ["openai"], index=0)
-    model = st.text_input("Modelo (OpenAI)", value="gpt-4o-mini")
+    st.header("🔑 API Key")
+    api_key_ui = st.text_input(
+        "OpenAI API Key (opcional)",
+        type="password",
+        value=st.session_state.get("OPENAI_API_KEY_UI", ""),
+        help="Se usa solo en esta sesión del navegador. En Streamlit Cloud, mejor usar Secrets.",
+    )
+    st.session_state["OPENAI_API_KEY_UI"] = (api_key_ui or "").strip()
+
+    # quick status
+    resolved = get_openai_key()
+    if resolved:
+        st.success("API Key detectada ✅")
+    else:
+        st.warning("No hay API Key. Añádela aquí, en Secrets o en variable de entorno.")
+
+    st.divider()
+
+    st.header("⚙️ Configuración LLM")
+    provider = st.selectbox("Proveedor", ["openai"], index=0)
+    model = st.text_input("Modelo", value="gpt-4o-mini")
     temperature = st.slider("Temperatura", 0.0, 1.0, 0.2, 0.05)
 
     st.divider()
     st.subheader("📥 Fuente de contenido")
-    source = st.radio("Selecciona fuente", ["Texto", "PDF", "Audio", "YouTube"], index=0)
+    source = st.radio("Selecciona fuente", ["Texto", "PDF", "Audio", "YouTube"], index=1)
 
     st.divider()
     st.subheader("🎯 Salidas")
@@ -327,11 +388,9 @@ with st.sidebar:
     n_quiz = st.slider("Nº preguntas quiz", 5, 40, 12, 1)
     quiz_diff = st.selectbox("Dificultad quiz", ["fácil", "media", "difícil"], index=1)
 
-    st.divider()
     st.caption("Tip: si el texto es enorme, la app lo trocea y fusiona resultados.")
 
 
-# Collect input content
 content = ""
 meta = {}
 
@@ -343,8 +402,7 @@ elif source == "PDF":
     pdf = st.file_uploader("Sube un PDF", type=["pdf"])
     if pdf is not None:
         try:
-            # pypdf can read from bytes via stream; easiest: pass file-like
-            content = _pdf_to_text(pdf)
+            content = _pdf_to_text(pdf.read())
             meta["pdf_name"] = pdf.name
             st.success(f"PDF cargado: {pdf.name} ({len(content):,} caracteres extraídos)")
         except Exception as e:
@@ -353,8 +411,8 @@ elif source == "Audio":
     audio = st.file_uploader("Sube un audio", type=["mp3", "wav", "m4a", "aac", "ogg", "flac"])
     st.caption("Transcripción: OpenAI (recomendado) o Whisper local (si lo tienes instalado).")
     stt_mode = st.radio("Modo de transcripción", ["OpenAI", "Whisper local"], index=0, horizontal=True)
+
     if audio is not None:
-        # Save to temp file
         with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{audio.name}") as tmp:
             tmp.write(audio.read())
             audio_path = tmp.name
@@ -388,7 +446,6 @@ elif source == "YouTube":
         except Exception as e:
             st.error(f"Error obteniendo transcript: {e}")
 
-# Main action
 st.divider()
 colA, colB = st.columns([1, 2])
 with colA:
@@ -401,89 +458,62 @@ if go:
         st.error("No hay contenido. Añade texto / sube un PDF / transcribe audio / añade un YouTube.")
         st.stop()
 
-    # Init LLM
     try:
         llm = LLM(LLMConfig(provider=provider, model=model, temperature=temperature))
     except Exception as e:
         st.error(str(e))
         st.stop()
 
-    # Chunking
     chunks = _chunk_text(content, max_chars=12000)
+    results: Dict[str, Any] = {}
 
-    results = {}
-
-    # Notes
     if want_notes:
         with st.spinner("Generando apuntes..."):
             results["notes_md"] = summarize_chunks(llm, chunks, detail)
 
-    # For structured JSON tasks, use a merged text (possibly shortened)
-    # If many chunks, we first build a condensed 'study context' to keep JSON generation stable.
-    study_context = content
-    if len(chunks) > 1:
+    # Context condensed for stable JSON outputs when content is large
+    if len(chunks) > 1 and (want_flashcards or want_quiz or want_mindmap):
         with st.spinner("Condensando contenido para flashcards/quiz/mindmap..."):
-            condensed_parts = []
-            for i, ch in enumerate(chunks, start=1):
-                part_sum = llm.chat(
-                    SYS_STUDY,
-                    f"""
-Resume esta parte en puntos clave (máx 15 viñetas), sin inventar.
-PARTE {i}/{len(chunks)}:
-\"\"\"{ch}\"\"\"
-""".strip(),
-                )
-                condensed_parts.append(part_sum)
-            study_context = _clean_text("\n\n".join(condensed_parts))
+            study_context = build_condensed_context(llm, chunks)
+    else:
+        study_context = content
 
-    # Flashcards
     if want_flashcards:
         with st.spinner("Generando flashcards..."):
             raw = llm.chat(SYS_STUDY, prompt_flashcards(study_context, n_flash))
             try:
                 results["flashcards_json"] = safe_parse_json(raw)
             except Exception:
-                # retry with stricter instruction
-                raw2 = llm.chat(
-                    SYS_STUDY,
-                    "Devuelve SOLO JSON válido. Sin markdown. " + prompt_flashcards(study_context, n_flash)
-                )
+                raw2 = llm.chat(SYS_STUDY, "Devuelve SOLO JSON válido. Sin markdown.\n\n" + prompt_flashcards(study_context, n_flash))
                 results["flashcards_json"] = safe_parse_json(raw2)
 
-    # Quiz
     if want_quiz:
         with st.spinner("Generando quiz..."):
             raw = llm.chat(SYS_STUDY, prompt_quiz(study_context, n_quiz, quiz_diff))
             try:
                 results["quiz_json"] = safe_parse_json(raw)
             except Exception:
-                raw2 = llm.chat(
-                    SYS_STUDY,
-                    "Devuelve SOLO JSON válido. Sin markdown. " + prompt_quiz(study_context, n_quiz, quiz_diff)
-                )
+                raw2 = llm.chat(SYS_STUDY, "Devuelve SOLO JSON válido. Sin markdown.\n\n" + prompt_quiz(study_context, n_quiz, quiz_diff))
                 results["quiz_json"] = safe_parse_json(raw2)
 
-    # Mindmap (Mermaid)
     if want_mindmap:
         with st.spinner("Generando mindmap (Mermaid)..."):
             mm = llm.chat(SYS_STUDY, prompt_mindmap(study_context))
-            # ensure it is a mermaid fenced block
             if "```" not in mm:
                 mm = "```mermaid\n" + mm.strip() + "\n```"
             results["mindmap_md"] = mm
 
-    # -----------------------------
-    # Render results
-    # -----------------------------
     st.success("Listo ✅")
+
     tab_labels = []
     if want_notes: tab_labels.append("📚 Apuntes")
     if want_flashcards: tab_labels.append("🃏 Flashcards")
     if want_quiz: tab_labels.append("📝 Quiz")
     if want_mindmap: tab_labels.append("🧩 Mindmap")
-    tabs = st.tabs(tab_labels) if tab_labels else []
 
+    tabs = st.tabs(tab_labels) if tab_labels else []
     t = 0
+
     if want_notes:
         with tabs[t]:
             st.markdown(results["notes_md"])
@@ -510,6 +540,7 @@ PARTE {i}/{len(chunks)}:
                 )
             else:
                 st.json(results.get("flashcards_json", {}))
+
             st.download_button(
                 "⬇️ Descargar flashcards (.json)",
                 data=json.dumps(results.get("flashcards_json", {}), ensure_ascii=False, indent=2).encode("utf-8"),
@@ -522,7 +553,7 @@ PARTE {i}/{len(chunks)}:
         with tabs[t]:
             q = results.get("quiz_json", {}).get("quiz", [])
             st.subheader(f"Quiz ({len(q)})")
-            # interactive render
+
             score = 0
             answered = 0
             for i, item in enumerate(q, start=1):
@@ -531,16 +562,17 @@ PARTE {i}/{len(chunks)}:
                 if not opts or len(opts) != 4:
                     st.warning("Pregunta con opciones inválidas. Revisa el JSON.")
                     continue
+
                 choice = st.radio(
                     label=f"Respuesta {i}",
                     options=list(range(4)),
                     format_func=lambda idx: opts[idx],
                     key=f"quiz_{i}",
-                    horizontal=False,
                 )
                 answered += 1
                 if choice == int(item.get("answer_index", -1)):
                     score += 1
+
                 with st.expander("Ver explicación"):
                     st.write(item.get("explanation", ""))
                 st.divider()

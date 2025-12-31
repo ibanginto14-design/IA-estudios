@@ -426,4 +426,3 @@ if go:
                 file_name=f"{doc_name}_presentacion.pptx",
                 mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
             )
-    

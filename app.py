@@ -8,13 +8,20 @@ from collections import Counter, defaultdict
 import streamlit as st
 
 # =========================
-# Optional PDF support
+# Optional deps
 # =========================
 PYPDF_OK = True
 try:
     from pypdf import PdfReader
 except Exception:
     PYPDF_OK = False
+
+PPTX_OK = True
+try:
+    from pptx import Presentation
+    from pptx.util import Inches, Pt
+except Exception:
+    PPTX_OK = False
 
 
 # =========================
@@ -100,7 +107,7 @@ def tfidf_sentence_scores(sentences):
     N = max(1, len(sentences))
     idf = {}
     for t, c in df.items():
-        idf[t] = math.log((N + 1) / (c + 1)) + 1.0  # smoothed
+        idf[t] = math.log((N + 1) / (c + 1)) + 1.0
 
     scores = []
     for toks in sent_tokens:
@@ -237,123 +244,109 @@ def generate_notes(text, detail):
 
     return "\n".join(md).strip()
 
-def generate_flashcards(text, n):
-    text = clean_text(text)
-    sentences = split_sentences(text)
-    kws = top_keywords(text, k=max(12, n))
-    cards = []
 
-    for term in kws:
-        if len(cards) >= n:
-            break
-        ds = find_def_sentence(term, sentences)
-        if ds:
-            cards.append({"front": f"¿Qué es {term}?", "back": ds, "tags": [term]})
+# =========================
+# PPTX generation
+# =========================
+def parse_md_sections(md_text):
+    """
+    Very tolerant Markdown parser:
+    - "# " -> title
+    - "## " -> section
+    - "- " -> bullets
+    """
+    md_text = (md_text or "").replace("\r\n", "\n").strip()
+    title = "Presentación"
+    sections = []
+    current = None
 
-    if len(cards) < n:
-        pool = [s for s in sentences if len(tokenize_words(s)) >= 6]
-        random.shuffle(pool)
-        for s in pool:
-            if len(cards) >= n:
-                break
-            toks = tokenize_words(s)
-            present = [t for t in toks if t in kws]
-            if not present:
-                continue
-            target = present[0]
-            cloze = re.sub(rf"\b{re.escape(target)}\b", "_____", s, flags=re.IGNORECASE)
-            cards.append({
-                "front": f"Completa: {cloze}",
-                "back": f"La palabra clave era **{target}**. Contexto: {s}",
-                "tags": [target]
-            })
+    for line in md_text.split("\n"):
+        line = line.rstrip()
+        if line.startswith("# "):
+            title = line[2:].strip() or title
+        elif line.startswith("## "):
+            if current:
+                sections.append(current)
+            current = {"title": line[3:].strip() or "Sección", "bullets": []}
+        elif line.startswith("- "):
+            if not current:
+                current = {"title": "Contenido", "bullets": []}
+            b = line[2:].strip()
+            if b:
+                # remove markdown bold ** **
+                b = b.replace("**", "")
+                current["bullets"].append(b)
+        else:
+            # ignore other lines
+            pass
 
-    return {"flashcards": cards[:n]}
+    if current:
+        sections.append(current)
 
-def generate_quiz(text, n, difficulty):
-    text = clean_text(text)
-    sentences = split_sentences(text)
-    kws = top_keywords(text, k=40)
-    if not sentences or not kws:
-        return {"quiz": []}
+    if not sections:
+        sections = [{"title": "Contenido", "bullets": [clean_text(md_text)[:500]]}]
 
-    candidates = [s for s in sentences if 8 <= len(tokenize_words(s)) <= 28]
-    if not candidates:
-        candidates = sentences[:]
+    return title, sections
 
-    random.shuffle(candidates)
-    quiz = []
-    used = set()
+def add_bullets_to_slide(slide, bullets, font_size=22):
+    body = slide.shapes.placeholders[1].text_frame
+    body.clear()
+    first = True
+    for b in bullets:
+        if first:
+            p = body.paragraphs[0]
+            first = False
+        else:
+            p = body.add_paragraph()
+        p.text = b
+        p.level = 0
+        p.font.size = Pt(font_size)
 
-    for s in candidates:
-        if len(quiz) >= n:
-            break
-        toks = tokenize_words(s)
-        present = [t for t in toks if t in kws]
-        if not present:
-            continue
+def notes_to_pptx_bytes(notes_md, deck_title="Presentación", max_bullets_per_slide=6):
+    if not PPTX_OK:
+        raise RuntimeError("Falta python-pptx. Añádelo a requirements.txt")
 
-        target = present[0]
-        key = (target, s[:60])
-        if key in used:
-            continue
-        used.add(key)
+    title, sections = parse_md_sections(notes_md)
+    if deck_title:
+        title = deck_title
 
-        distractors = [k for k in kws if k != target]
-        random.shuffle(distractors)
-        if difficulty == "difícil":
-            distractors.sort(key=lambda x: abs(len(x) - len(target)))
+    prs = Presentation()
 
-        opts = [target] + distractors[:3]
-        random.shuffle(opts)
+    # Title slide
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    slide.shapes.title.text = title
+    if len(slide.placeholders) > 1:
+        slide.placeholders[1].text = "Generado automáticamente desde apuntes"
 
-        cloze = re.sub(rf"\b{re.escape(target)}\b", "_____", s, flags=re.IGNORECASE)
-        quiz.append({
-            "question": f"Completa la frase: {cloze}",
-            "options": opts,
-            "answer_index": opts.index(target),
-            "explanation": f"En el texto aparece: {s}"
-        })
+    # Agenda
+    agenda = prs.slides.add_slide(prs.slide_layouts[1])
+    agenda.shapes.title.text = "Agenda"
+    agenda_items = [s["title"] for s in sections][:10]
+    add_bullets_to_slide(agenda, agenda_items, font_size=24)
 
-    return {"quiz": quiz[:n]}
+    # Content slides (split long bullet lists)
+    for sec in sections:
+        bullets = sec.get("bullets", []) or ["(Sin puntos detectados en esta sección)"]
+        chunks = [bullets[i:i + max_bullets_per_slide] for i in range(0, len(bullets), max_bullets_per_slide)]
 
-def generate_mindmap_mermaid(text):
-    text = clean_text(text)
-    if not text:
-        return "```mermaid\nmindmap\n  root((Sin contenido))\n```"
+        for j, chunk in enumerate(chunks):
+            slide = prs.slides.add_slide(prs.slide_layouts[1])
+            t = sec["title"] if j == 0 else f"{sec['title']} (cont.)"
+            slide.shapes.title.text = t
+            add_bullets_to_slide(slide, chunk, font_size=22)
 
-    kws = top_keywords(text, k=18)
-    root = kws[0].capitalize() if kws else "Tema"
-    sents = split_sentences(text)
-
-    co = defaultdict(Counter)
-    for s in sents:
-        toks = set(tokenize_words(s))
-        present = [k for k in kws if k in toks]
-        for a in present:
-            for b in present:
-                if a != b:
-                    co[a][b] += 1
-
-    lines = ["```mermaid", "mindmap", f"  root(({root}))"]
-    for k in kws[1:7]:
-        lines.append(f"    {k}")
-        for sub, _ in co[k].most_common(2):
-            lines.append(f"      {sub}")
-    lines.append("```")
-    return "\n".join(lines)
+    # Export to bytes
+    bio = io.BytesIO()
+    prs.save(bio)
+    bio.seek(0)
+    return bio.getvalue()
 
 
 # =========================
 # UI
 # =========================
-st.set_page_config(page_title="StudyWave (sin API)", page_icon="🧠", layout="wide")
-st.title("🧠 StudyWave — Apuntes + Flashcards + Quiz + Mindmap (SIN API)")
-
-st.info(
-    "Esta versión NO usa ChatGPT ni modelos en la nube. "
-    "Funciona sin API y sin descargar modelos, usando NLP clásica (resumen extractivo + heurísticas)."
-)
+st.set_page_config(page_title="StudyWave (sin API) + PPTX", page_icon="🧠", layout="wide")
+st.title("🧠 StudyWave — Apuntes + Presentación (.pptx) (SIN API)")
 
 with st.sidebar:
     st.header("📥 Fuente")
@@ -362,25 +355,25 @@ with st.sidebar:
     st.divider()
     st.header("🎯 Salidas")
     want_notes = st.checkbox("Generar apuntes", True)
-    want_flashcards = st.checkbox("Generar flashcards", True)
-    want_quiz = st.checkbox("Generar quiz", True)
-    want_mindmap = st.checkbox("Generar mindmap (Mermaid)", True)
+    want_pptx = st.checkbox("Generar presentación (.pptx)", True)
 
     st.divider()
     detail = st.selectbox("Nivel de apuntes", ["breve", "medio", "exhaustivo"], index=1)
-    n_flash = st.slider("Nº flashcards", 5, 60, 20, 1)
-    n_quiz = st.slider("Nº preguntas quiz", 5, 40, 12, 1)
-    quiz_diff = st.selectbox("Dificultad quiz", ["fácil", "media", "difícil"], index=1)
+    max_bullets = st.slider("Máx. bullets por diapositiva", 4, 10, 6, 1)
+
+    st.caption("Nota: La PPTX se genera a partir de los apuntes (Markdown).")
 
 content = ""
+doc_name = "apuntes"
 
 if source == "Texto":
-    content = st.text_area("Pega aquí tu texto", height=260, placeholder="Pega apuntes, artículos, etc.")
+    content = st.text_area("Pega aquí tus apuntes", height=260, placeholder="Pega apuntes, temas, etc.")
 else:
     if not PYPDF_OK:
-        st.warning("Para leer PDFs necesitas `pypdf` (no es un modelo, solo un lector de PDF).")
+        st.warning("Para leer PDFs necesitas `pypdf` (solo lector).")
     pdf = st.file_uploader("Sube un PDF", type=["pdf"])
     if pdf is not None:
+        doc_name = re.sub(r"\.pdf$", "", pdf.name, flags=re.IGNORECASE) or "apuntes"
         try:
             b = pdf.read()
             if not PYPDF_OK:
@@ -393,111 +386,44 @@ else:
             st.error(f"Error leyendo PDF: {e}")
 
 st.divider()
-go = st.button("✨ Generar materiales", type="primary", use_container_width=True)
+go = st.button("✨ Generar", type="primary", use_container_width=True)
 
 if go:
-    if not content.strip():
+    if not (content or "").strip():
         st.error("No hay contenido. Añade texto o sube un PDF.")
         st.stop()
 
-    results = {}
-
+    notes_md = ""
     if want_notes:
-        with st.spinner("Generando apuntes (NLP clásica)..."):
-            results["notes_md"] = generate_notes(content, detail)
+        with st.spinner("Generando apuntes..."):
+            notes_md = generate_notes(content, detail)
+        st.success("Apuntes listos ✅")
+        st.markdown(notes_md)
+        st.download_button(
+            "⬇️ Descargar apuntes (.md)",
+            data=notes_md.encode("utf-8"),
+            file_name=f"{doc_name}_apuntes.md",
+            mime="text/markdown",
+        )
+    else:
+        # Si no genera apuntes, creamos una “pseudo-nota” con el texto original
+        notes_md = f"# {doc_name}\n\n## Contenido\n- " + "\n- ".join(split_sentences(content)[:30])
 
-    if want_flashcards:
-        with st.spinner("Generando flashcards..."):
-            results["flashcards_json"] = generate_flashcards(content, n_flash)
-
-    if want_quiz:
-        with st.spinner("Generando quiz..."):
-            results["quiz_json"] = generate_quiz(content, n_quiz, quiz_diff)
-
-    if want_mindmap:
-        with st.spinner("Generando mindmap..."):
-            results["mindmap_md"] = generate_mindmap_mermaid(content)
-
-    st.success("Listo ✅")
-
-    tabs = []
-    if want_notes: tabs.append("📚 Apuntes")
-    if want_flashcards: tabs.append("🃏 Flashcards")
-    if want_quiz: tabs.append("📝 Quiz")
-    if want_mindmap: tabs.append("🧩 Mindmap")
-
-    tab_objs = st.tabs(tabs) if tabs else []
-    ti = 0
-
-    if want_notes:
-        with tab_objs[ti]:
-            st.markdown(results["notes_md"])
-            st.download_button(
-                "⬇️ Descargar apuntes (.md)",
-                data=results["notes_md"].encode("utf-8"),
-                file_name="apuntes.md",
-                mime="text/markdown",
-            )
-        ti += 1
-
-    if want_flashcards:
-        with tab_objs[ti]:
-            st.subheader(f"Flashcards ({len(results['flashcards_json'].get('flashcards', []))})")
-            st.json(results["flashcards_json"])
-            st.download_button(
-                "⬇️ Descargar flashcards (.json)",
-                data=json.dumps(results["flashcards_json"], ensure_ascii=False, indent=2).encode("utf-8"),
-                file_name="flashcards.json",
-                mime="application/json",
-            )
-        ti += 1
-
-    if want_quiz:
-        with tab_objs[ti]:
-            q = results["quiz_json"].get("quiz", [])
-            st.subheader(f"Quiz ({len(q)})")
-
-            score = 0
-            answered = 0
-            for i, item in enumerate(q, start=1):
-                st.markdown(f"**{i}. {item.get('question','')}**")
-                opts = item.get("options", [])
-                if len(opts) != 4:
-                    st.warning("Pregunta inválida (opciones).")
-                    continue
-
-                choice = st.radio(
-                    label=f"Respuesta {i}",
-                    options=list(range(4)),
-                    format_func=lambda idx: opts[idx],
-                    key=f"quiz_{i}",
+    if want_pptx:
+        if not PPTX_OK:
+            st.warning("No puedo generar PPTX porque falta `python-pptx`. Añádelo a requirements.txt.")
+        else:
+            with st.spinner("Generando presentación (.pptx)..."):
+                pptx_bytes = notes_to_pptx_bytes(
+                    notes_md,
+                    deck_title=doc_name,
+                    max_bullets_per_slide=max_bullets
                 )
-                answered += 1
-                if choice == int(item.get("answer_index", -1)):
-                    score += 1
-
-                with st.expander("Ver explicación"):
-                    st.write(item.get("explanation", ""))
-                st.divider()
-
-            if answered:
-                st.info(f"Puntuación: **{score}/{answered}**")
-
+            st.success("Presentación lista ✅")
             st.download_button(
-                "⬇️ Descargar quiz (.json)",
-                data=json.dumps(results["quiz_json"], ensure_ascii=False, indent=2).encode("utf-8"),
-                file_name="quiz.json",
-                mime="application/json",
+                "⬇️ Descargar presentación (.pptx)",
+                data=pptx_bytes,
+                file_name=f"{doc_name}_presentacion.pptx",
+                mime="application/vnd.openxmlformats-officedocument.presentationml.presentation",
             )
-        ti += 1
-
-    if want_mindmap:
-        with tab_objs[ti]:
-            st.subheader("Mindmap (Mermaid)")
-            st.code(results["mindmap_md"], language="markdown")
-            st.download_button(
-                "⬇️ Descargar mindmap (.md)",
-                data=results["mindmap_md"].encode("utf-8"),
-                file_name="mindmap.md",
-                mime="text/markdown",
-            )
+    
